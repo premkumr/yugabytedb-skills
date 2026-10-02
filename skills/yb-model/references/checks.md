@@ -74,8 +74,10 @@ cannot `SPLIT AT VALUES` on a hidden column — and if the base PK is range-shar
 monotonic column it inherits that ordering and concentrates at the tail. Treat `HASH` on
 low cardinality as the hard defect and `ASC` as a ramp problem.
 
-- **Hash sharding is not always the default.** If the Enhanced Postgres Compatibility Mode
-(EPCM) is enabled then the default hashing becomes `ASC` to match Postgres behavior. Users
+- **Hash sharding is not always the default.** An unannotated first key column is `HASH`
+only when `yb_use_hash_splitting_by_default` is on and the relation is neither colocated nor
+in a tablegroup (`pg_yb_utils.c`). Otherwise it is `ASC`. Enhanced Postgres Compatibility
+Mode (EPCM) turns that setting off, so the default becomes `ASC` to match Postgres behavior. Users
 completely miss this and assume `HASH` is the default and think that the table and indexes
 will be HASH distributed. It is important to **explicitly** add the sharding scheme
 (`HASH`/`ASC`/`DESC`) on the PRIMARY KEY to avoid surprises.
