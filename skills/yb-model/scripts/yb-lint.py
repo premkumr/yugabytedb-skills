@@ -236,7 +236,8 @@ def check_table(st, findings):
             )
         )
 
-    if partition_by and has_split:
+    # ysql_dump writes SPLIT INTO 1 TABLETS on every parent; only a real split is a mistake.
+    if partition_by and has_split and not re.search(r"\bSPLIT\s+INTO\s+1\s+TABLETS\b", t, re.I):
         findings.append(
             Finding(
                 "YB011",
@@ -260,7 +261,8 @@ def check_table(st, findings):
                 pk_cols = [(cname, "")]
                 break
 
-    if not pk_cols and not is_partition_of and body:
+    # A partitioned parent without a PK is the documented shape when uniqueness is per child.
+    if not pk_cols and not is_partition_of and body and not partition_by:
         findings.append(
             Finding(
                 "YB020",
@@ -370,7 +372,7 @@ def check_table(st, findings):
 def check_index(st, findings, index_registry, table_cols=None):
     t = st.text
     m = re.search(
-        r"CREATE\s+(UNIQUE\s+)?INDEX\s+(CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?"
+        r"CREATE\s+(UNIQUE\s+)?INDEX\s+((?:NON)?CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?"
         r"([\w.\"]+)\s+ON\s+(?:ONLY\s+)?([\w.\"]+)",
         t,
         re.I,

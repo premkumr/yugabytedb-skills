@@ -1,0 +1,84 @@
+{
+ "about": "Written by evals/yb-model/oracle.py. Do not edit by hand.",
+ "rules": {
+  "CAP001": [
+   {
+    "mode": "on",
+    "observation": "planner chose an Index Scan with a partial hash-key Index Cond in 7 of 240 generated cases",
+    "release": "2026.1.1.2"
+   },
+   {
+    "mode": "on",
+    "observation": "forced partial hash-key Index Scan read 20000 of 20000 rows to return 20 (14 read requests)",
+    "release": "2026.1.1.2"
+   },
+   {
+    "mode": "legacy_mode",
+    "observation": "forced partial hash-key Index Scan read 20000 of 20000 rows to return 20 (14 read requests)",
+    "release": "2026.1.1.2"
+   },
+   {
+    "mode": "on",
+    "observation": "planner chose an Index Scan with a partial hash-key Index Cond in 7 of 240 generated cases",
+    "release": "2026.1.0.0"
+   },
+   {
+    "mode": "on",
+    "observation": "forced partial hash-key Index Scan read 20000 of 20000 rows to return 20 (14 read requests)",
+    "release": "2026.1.0.0"
+   }
+  ],
+  "CAP012": [
+   {
+    "mode": "on",
+    "observation": "planner walked the predicted index in ORDER BY order without a seek in 10 of 240 generated cases",
+    "release": "2026.1.1.2"
+   },
+   {
+    "mode": "legacy_mode",
+    "observation": "planner walked the predicted index in ORDER BY order without a seek in 11 of 240 generated cases",
+    "release": "2026.1.1.2"
+   },
+   {
+    "mode": "on",
+    "observation": "planner walked the predicted index in ORDER BY order without a seek in 10 of 240 generated cases",
+    "release": "2026.1.0.0"
+   }
+  ]
+ },
+ "runs": [
+  {
+   "by_kind": {
+    "cost": 12,
+    "full-index-walk": 7
+   },
+   "capability_disagreements": 0,
+   "cases": 240,
+   "mode": "on",
+   "release": "2026.1.0.0",
+   "seed": 11
+  },
+  {
+   "by_kind": {
+    "cost": 18,
+    "full-index-walk": 2
+   },
+   "capability_disagreements": 0,
+   "cases": 240,
+   "mode": "legacy_mode",
+   "release": "2026.1.1.2",
+   "seed": 11
+  },
+  {
+   "by_kind": {
+    "cost": 9,
+    "full-index-walk": 8
+   },
+   "capability_disagreements": 0,
+   "cases": 240,
+   "mode": "on",
+   "release": "2026.1.1.2",
+   "seed": 7
+  }
+ ]
+}

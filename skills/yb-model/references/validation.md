@@ -2,6 +2,11 @@
 
 Contents: A) query pack · B) reading the results · C) config baseline · D) sign-off gate
 
+`scripts/collect.sql` already captures A1, A4, A6, A7 and A8, plus settings and version.
+`yb-model.py review --replay` already runs EXPLAIN on every pattern against injected
+statistics. Use this file for the live-cluster checks that remain: `EXPLAIN (ANALYZE,
+DIST)` on the target, parse-checking recommended DDL, and the sign-off gate.
+
 ---
 
 ## A. Query pack
