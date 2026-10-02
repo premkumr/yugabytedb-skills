@@ -476,5 +476,54 @@ class Probes(unittest.TestCase):
         self.assertIn("9.9.9.9", recon[0]["outcome"])
 
 
+class IndexRuleEdges(unittest.TestCase):
+    """Partial queue indexes, two-valued columns, and drops that settle other findings."""
+
+    def run_b(self, ddl, stats=None, rows=None):
+        files = {"schema.sql": ddl}
+        if stats:
+            files["ybm_pg_stats.csv"] = ("schemaname,tablename,attname,inherited,null_frac,"
+                                         "avg_width,n_distinct,most_common_vals,"
+                                         "most_common_freqs,histogram_bounds,correlation\n" +
+                                         "".join("public,%s\n" % r for r in stats))
+        if rows:
+            files["ybm_reltuples.csv"] = "relname,relkind,reltuples\n" + "".join(
+                "%s,r,%s\n" % kv for kv in rows.items())
+        d = Preflight.make(self, files)
+        return analyze.run(inputs.load(d))
+
+    def test_partial_queue_index_on_a_flag_is_not_flagged(self):
+        res = self.run_b("CREATE TABLE q (id bigint NOT NULL, done boolean NOT NULL, "
+                         "PRIMARY KEY ((id) HASH));\n"
+                         "CREATE INDEX q_todo ON q (done ASC) WHERE (done = false);\n",
+                         stats=["q,done,f,0,1,1,{f},{1},,1"], rows={"q": 1000000})
+        rules = {(f["rule"], f["index"]) for f in res["findings"]}
+        self.assertNotIn(("STA008", "q_todo"), rules)
+        self.assertNotIn(("STA004", "q_todo"), rules)
+
+    def test_absolute_skew_severity_scales_with_rows_on_one_hash_code(self):
+        ddl = ("CREATE TABLE s (id bigint NOT NULL, g bigint NOT NULL, "
+               "PRIMARY KEY ((id) HASH));\nCREATE INDEX s_g ON s ((g) HASH);\n")
+        want = {1e7: "low", 5e8: "medium", 5e9: "high"}  # top value holds 2% of rows
+        for rows, sev in want.items():
+            res = self.run_b(ddl, stats=["s,g,f,0,8,5000,{7},{0.02},,0"], rows={"s": int(rows)})
+            got = [f["severity"] for f in res["findings"] if f["rule"] == "STA003"]
+            self.assertEqual(got, [sev], rows)
+
+    def test_drop_settles_other_findings_on_the_index(self):
+        res = self.run_b("CREATE TABLE f (id bigint NOT NULL, flag boolean, "
+                         "PRIMARY KEY ((id) HASH));\n"
+                         "CREATE INDEX f_flag ON f ((flag) HASH);\n",
+                         stats=["f,flag,f,0.6,1,2,{t},{0.3},,0"], rows={"f": 10000000})
+        on = [f for f in res["findings"] if f["index"] == "f_flag"]
+        drop = [f for f in on if f["rule"] == "STA008"]
+        self.assertEqual(len(drop), 1)
+        self.assertIn("idx_scan", drop[0]["ddl"])
+        others = [f for f in on if f["rule"] != "STA008"]
+        self.assertTrue(others)
+        self.assertTrue(all(f["ddl"] is None for f in others))
+        self.assertNotIn("SAF002", {f["rule"] for f in res["findings"]})
+
+
 if __name__ == "__main__":
     unittest.main()

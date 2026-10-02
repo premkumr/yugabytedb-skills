@@ -38,7 +38,9 @@ THRESHOLDS = {
     "small_rows": 1e6,          # < 1M rows: access-path findings drop one level
     "split_rows": 1e7,          # SPL001: >= 10M rows still on one tablet
     "runway_days": 120,         # PRT001: last RANGE partition ends within 120 days
-    "mcv_rows_low": 1e5,        # STA003 low when one value holds >= 100k rows on a hash code
+    "mcv_rows_low": 1e5,        # STA003 low when one value holds >= 100k rows on a hash code,
+    "mcv_rows_medium": 1e7,     # ... medium at >= 10M (one hash code is never split across
+    "mcv_rows_high": 1e8,       # ... tablets), high at >= 100M
     "all_null": 0.999,          # STA006: column is (almost) entirely NULL
     "zero_rows_calls": 10000,
     "miss_rate_rows": 0.05,     # WRK005: <= 0.05 rows per call (>= 95% of calls find nothing)   # WRK005: SELECT returning 0 rows over >= 10k calls
@@ -958,6 +960,7 @@ def run(bundle, plans=None, schema_override=None):
                     big = rows is None or rows >= THRESHOLDS["tiny_rows"]
                     if nd is not None and big and nd < THRESHOLDS["ndistinct_medium"]:
                         sev = "high" if nd < THRESHOLDS["ndistinct_high"] else "medium"
+                        sev = shift(sev, size_shift(rows))
                         col.add(Finding("STA002", sev, "confirmed",
                                         "%s(%s)" % (idx.name, lead.col),
                                         "%s hashes %s.%s, which has ~%s distinct values%s." % (
@@ -982,6 +985,7 @@ def run(bundle, plans=None, schema_override=None):
                     big = rows is None or rows >= THRESHOLDS["tiny_rows"]
                     if big and top >= THRESHOLDS["mcv_medium"]:
                         sev = "high" if top >= THRESHOLDS["mcv_high"] else "medium"
+                        sev = shift(sev, size_shift(rows))
                         col.add(Finding("STA003", sev, "confirmed",
                                         "%s(%s)" % (idx.name, lead.col),
                                         "%s hashes %s.%s; its most common value holds %.1f%% of "
@@ -989,6 +993,7 @@ def run(bundle, plans=None, schema_override=None):
                                         table=tname, index=idx.name))
             elif lead.mode in ("ASC", "DESC") and not coloc and not idx.is_pk and t.pk and \
                     t.pk.keys and t.pk.keys[0].mode == "HASH" and \
+                    not _few_values(t, lead.col, st, rows, idx) and \
                     (re.search(r"timestamp|date", t.cols.get(lead.col, {}).get("type", "")) or
                      MONOTONIC_NAME.match(lead.col)):
                 nd = n_distinct_abs(st, rows) if st else None
@@ -1009,7 +1014,8 @@ def run(bundle, plans=None, schema_override=None):
                                         idx.name, tname, lead.col, lead.col, lead.mode,
                                         ", ".join("(%d)" % b for b in range(1, 16)),
                                         idx.name, idx.name)))
-            elif lead.mode in ("ASC", "DESC") and not coloc:
+            elif lead.mode in ("ASC", "DESC") and not coloc and \
+                    not _few_values(t, lead.col, st, rows, idx):
                 if st is not None and st.get("correlation") is not None:
                     corr = st["correlation"]
                     ww = write_weight.get(tname)
@@ -1037,14 +1043,17 @@ def run(bundle, plans=None, schema_override=None):
                                          idx.name, tname, lead.col, lead.col, lead.mode,
                                          ", ".join("(%d)" % b for b in range(1, 16)),
                                          idx.name, idx.name))
-                        col.add(Finding("STA004", sev, "confirmed",
+                        seen_writes = bool(ww or writes_measured)
+                        col.add(Finding("STA004", sev,
+                                        "confirmed" if seen_writes else "probable",
                                         "%s(%s)" % (idx.name, lead.col),
-                                        "%s leads with %s.%s %s; correlation %.2f, and the table "
-                                        "is written (%s)." % (
+                                        "%s leads with %s.%s %s; correlation %.2f%s." % (
                                             idx.name, tname, lead.col, lead.mode, corr,
-                                            ("%s write pattern" % ww) if ww else
-                                            "pg_stat_user_tables" if writes_measured else
-                                            "no workload data"),
+                                            (", and the table is written (%s)" % (
+                                                ("%s write pattern" % ww) if ww else
+                                                "pg_stat_user_tables")) if seen_writes else
+                                            "; write activity was not captured, so this applies "
+                                            "only if rows are still inserted in that order"),
                                         table=tname, index=idx.name, fix=s4fix, ddl=s4ddl))
                     elif abs(corr) < 0.3:
                         sound.append("%s: range lead %s.%s is not insertion-ordered "
@@ -1183,6 +1192,8 @@ def run(bundle, plans=None, schema_override=None):
         if not t or not idx.keys or not idx.keys[0].col:
             continue
         typ = t.cols.get(idx.keys[0].col, {}).get("type", "")
+        if idx.where and re.search(r"\b%s\b" % re.escape(idx.keys[0].col), idx.where):
+            continue  # a partial index on the flag value is the shape this rule recommends
         if typ in ("boolean", "bool") and len(idx.keys) == 1:
             col.add(Finding("STA008", "medium", "confirmed", iname,
                             "%s indexes %s.%s, a boolean: at most two key values%s." % (
@@ -1203,11 +1214,16 @@ def run(bundle, plans=None, schema_override=None):
             if not st or not st["mcf"]:
                 continue
             top = st["mcf"][0]
-            if top < THRESHOLDS["mcv_medium"] and top * rows >= THRESHOLDS["mcv_rows_low"]:
-                col.add(Finding("STA003", "low", "confirmed", "%s(%s)" % (idx.name, idx.keys[0].col),
+            n_top = top * rows
+            if top < THRESHOLDS["mcv_medium"] and n_top >= THRESHOLDS["mcv_rows_low"]:
+                sev = "high" if n_top >= THRESHOLDS["mcv_rows_high"] else \
+                    "medium" if n_top >= THRESHOLDS["mcv_rows_medium"] else "low"
+                col.add(Finding("STA003", sev, "confirmed", "%s(%s)" % (idx.name, idx.keys[0].col),
                                 "%s hashes %s.%s; its most common value holds %.2f%% of rows, "
-                                "~%s rows on one hash code." % (
-                                    idx.name, tname, idx.keys[0].col, 100 * top, _fmt(top * rows)),
+                                "~%s rows on one hash code%s." % (
+                                    idx.name, tname, idx.keys[0].col, 100 * top, _fmt(n_top),
+                                    ", which can never be split across tablets"
+                                    if sev != "low" else ""),
                                 table=tname, index=idx.name,
                                 fix="Confirm the dominant value is expected; if it keeps growing, "
                                     "make the hash group composite with a second column the "
@@ -1596,6 +1612,24 @@ def run(bundle, plans=None, schema_override=None):
                  "only if a reader outside the captured workload needs it: %s" % (
                      f.index, " and idx_scan is 0" if measured else
                      " (idx_scan not captured: check it first)", f.fix or ""))
+    # A finding that drops an index outright settles every other finding on that index: their
+    # rebuilds would recreate what is being dropped. Every bare DROP starts with an idx_scan check
+    # unless pg_stat_user_indexes showed 0 scans.
+    ranked = sorted(col.items.values(), key=lambda f: (SEV.index(f.severity), f.rule, f.obj))
+    drops = {}
+    for f in ranked:
+        if f.index and f.ddl and _pure_drop(f.ddl, f.index) and f.index not in drops:
+            drops[f.index] = f
+    for f in ranked:
+        d = drops.get(f.index)
+        if d is not None and d is not f and f.ddl:
+            f.ddl = None
+            f.fix = "Dropping %s (see the %s finding) resolves this too." % (f.index, d.rule)
+    for iname, f in sorted(drops.items()):
+        u = bundle.index_usage.get(iname)
+        if (u is None or u["idx_scan"] > 0) and "idx_scan" not in f.ddl:
+            f.ddl = ("-- first: SELECT idx_scan FROM pg_stat_user_indexes WHERE indexrelname = "
+                     "'%s';  drop only if 0\n" % iname) + f.ddl
     from . import safety as safety_mod
     import sys as _sys
     safety_report = safety_mod.check(sch, patterns, col, _sys.modules[__name__], ps, bundle,
@@ -1642,6 +1676,26 @@ def run(bundle, plans=None, schema_override=None):
 def probes_all():
     from . import probes
     return probes.rules_with_probes()
+
+
+def _pure_drop(ddl, index):
+    """DDL that only drops the index (optionally after the idx_scan check), as opposed to a
+    rebuild or a re-key that drops it because something replaces it."""
+    lines = [l.strip() for l in ddl.splitlines() if l.strip()]
+    return bool(lines) and index in ddl and all(
+        re.match(r"(?i)DROP\s+INDEX\b", l) or l.startswith("-- first: SELECT idx_scan")
+        for l in lines)
+
+
+def _few_values(t, col, st, rows, idx):
+    """A column that cannot be insertion-ordered in a meaningful way: a boolean, one with fewer
+    than 100 distinct values, or one a partial index pins with its WHERE clause."""
+    if t.cols.get(col, {}).get("type", "") in ("boolean", "bool"):
+        return True
+    if idx.where and re.search(r"\b%s\s*=" % re.escape(col), idx.where):
+        return True
+    nd = n_distinct_abs(st, rows) if st else None
+    return nd is not None and nd < 100
 
 
 def _key_inferred(sch, f):
