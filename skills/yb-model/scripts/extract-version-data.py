@@ -2,7 +2,8 @@
 """
 extract-version-data: build rules/versions.json from the yugabyte-db source, per release tag.
 Nothing version-specific is written by hand; every value below is read from the source of the
-release it describes.
+release it describes. rules/versions.json is a local cache: build the releases you review, and
+never commit it.
 
     # every release since 2.20 from a local checkout (no checkout of tags; uses git show)
     python3 extract-version-data.py --repo ~/yugabyte-db
@@ -50,6 +51,13 @@ PG_WRAPPER = "src/yb/yql/pgwrapper/pg_wrapper.cc"
 YUGABYTED = "bin/yugabyted"
 YBA_ROOT = "managed/src/main/java"
 GITHUB_RAW = "https://raw.githubusercontent.com/yugabyte/yugabyte-db/%s/%s"
+# Files a GitHub run searches, because raw GitHub has no grep. A git run records the files where
+# it actually found each fact (source_paths in the cache), and later GitHub runs use those.
+DEFAULT_SOURCE_PATHS = {
+    "src/yb": ["src/yb/common/common_flags.cc", "src/yb/master/catalog_manager_bg_tasks.cc",
+               "src/yb/server/server_common_flags.cc"],
+    YBA_ROOT: [YBA_ROOT + "/com/yugabyte/yw/controllers/handlers/UniverseCRUDHandler.java"],
+}
 
 
 def vtuple(tag):
@@ -256,7 +264,7 @@ def main():
     if args.github:
         if not args.release:
             ap.error("--github needs --release")
-        sp = {k: v for k, v in (data.get("source_paths") or {}).items()}
+        sp = {k: v for k, v in (data.get("source_paths") or DEFAULT_SOURCE_PATHS).items()}
         src = GitHubSource(sp)
         tags = ["v" + r.lstrip("v") for r in args.release]
     elif args.repo:

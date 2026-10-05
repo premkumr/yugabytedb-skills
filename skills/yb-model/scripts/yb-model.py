@@ -85,7 +85,8 @@ def main():
     p.add_argument("bundle")
     p.add_argument("--json", action="store_true")
     p = sub.add_parser("update-versions",
-                       help="add or refresh releases in rules/versions.json from yugabyte-db")
+                       help="build or refresh the local release cache (rules/versions.json) from "
+                            "yugabyte-db; never committed")
     p.add_argument("--repo", help="local yugabyte-db checkout (all releases, or --release)")
     p.add_argument("--github", action="store_true",
                    help="fetch from github.com (network; ask the user first)")

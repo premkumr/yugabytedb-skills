@@ -147,8 +147,9 @@ If the engine cannot run on this surface, say so and review by hand with
 
 Behaviour and defaults differ between YugabyteDB releases and between deployment tools on
 the same release (yugabyted and YBA new universes turn the cost model on; a manual install or
-an upgraded universe keeps `legacy_mode`). The engine handles this from
-`rules/versions.json`; your job is only to report what it says:
+an upgraded universe keeps `legacy_mode`). The engine reads these facts from a local cache,
+`rules/versions.json`, built from the yugabyte-db source for the releases being reviewed
+(it is not shipped with the skill). Your job is only to report what the engine says:
 
 - Settings come from the bundle's pg_settings. Without them, the release default is used
   only when every deployment tool agrees; otherwise the finding is conditional and the open
@@ -159,11 +160,12 @@ an upgraded universe keeps `legacy_mode`). The engine handles this from
   pinned by tests on <release>".
 - Replay on an image that is not the customer's exact release lists the differences between
   the two releases, and does not confirm rules whose tested behaviour differs.
-- If the open items contain `RELEASE-DATA-MISSING`, the customer's release is newer than (or
-  absent from) the table. **Ask the user** whether you may fetch its source facts from
-  GitHub. Only if they agree, run the command quoted in that item, then run the review
-  again. If they decline, keep the review and say its release facts come from the nearest
-  release named in the item.
+- If the open items contain `RELEASE-DATA-MISSING`, the cache has no entry for the customer's
+  release (on a fresh install it is empty). If the user has a yugabyte-db checkout, run the
+  `--repo` command quoted in that item with its path; it reads local files only. Otherwise
+  **ask the user** whether you may fetch the release's source facts from GitHub, and run the
+  `--github` command only if they agree. Then run the review again. If they decline, keep
+  the review and say which release facts are unknown or come from the nearest release.
 
 ### 3. Replay
 

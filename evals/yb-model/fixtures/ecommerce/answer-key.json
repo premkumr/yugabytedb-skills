@@ -1,6 +1,6 @@
 {
   "fixture": "ecommerce",
-  "about": "Planted defects in setup.sql / load.sql / workload.sql. Row counts in bundle/ybm_reltuples.csv are measured counts x100 (build.sh SCALE). 'engine_match' is what yb-model.py must emit; 'judge' is what a grader looks for in a free-text review. 'traps' are things a review should NOT claim.",
+  "about": "Planted defects in setup.sql / load.sql / gen_workload.py. Row counts in bundle/ybm_reltuples.csv are measured counts x100 (build.sh SCALE). 'engine_match' is what yb-model.py must emit; 'judge' is what a grader looks for in a free-text review. 'traps' are things a review should NOT claim.",
   "defects": [
     {"id": "K1", "severity": "high", "pattern": "SELECT sku, qty, price FROM order_items WHERE order_id = $1 (P1, 91% of time)",
      "judge": "order_items PK is HASH over (order_id, line_no); the lookup binds only order_id, so the PK cannot be used and every call scans the table. Fix: PRIMARY KEY ((order_id) HASH, line_no ASC).",

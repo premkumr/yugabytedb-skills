@@ -98,6 +98,15 @@
       "skills": [
         "./skills/yb-query-analysis"
       ]
+    },
+    {
+      "name": "yb-model",
+      "description": "Review/validate a YugabyteDB YSQL schema for distribution, sharding, indexing, partitioning, tablet-split and write-path defects, with a DDL linter and an independent second pass. Use whenever the user mentions YugabyteDB, YSQL, DocDB, tablets, hash or range sharding, hot shards, tablet skew, redundant or unused indexes, or Voyager, or pastes DDL, a pg_dump, pg_stats, pg_stat_statements or a tablet report and asks whether it looks right, even if they never say the word review. Also use when someone types yb-model.",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/yb-model"
+      ]
     }
   ]
 }

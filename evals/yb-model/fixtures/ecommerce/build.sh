@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rebuild this fixture's bundle/ from setup.sql, load.sql and workload.sql on a scratch
+# Rebuild this fixture's bundle/ from setup.sql, load.sql and gen_workload.py on a scratch
 # YugabyteDB container. Usage: ./build.sh [image]   (default: newest local yugabytedb/yugabyte)
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -14,7 +14,7 @@ docker exec "$C" bash -c 'bin/ysqlsh -h $(hostname) -X -q -c "CREATE DATABASE sh
 q < setup.sql
 q < load.sql
 q -c "'CREATE EXTENSION IF NOT EXISTS pg_stat_statements; SELECT pg_stat_statements_reset();'" >/dev/null
-q < workload.sql >/dev/null
+python3 gen_workload.py | q >/dev/null
 rm -rf bundle && mkdir bundle
 docker exec "$C" mkdir -p /tmp/bundle
 docker cp "$SKILL/scripts/collect.sql" "$C:/tmp/bundle/collect.sql"

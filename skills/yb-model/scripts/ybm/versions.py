@@ -1,4 +1,6 @@
-"""Release-aware facts from rules/versions.json (built by scripts/extract-version-data.py).
+"""Release-aware facts from rules/versions.json, a local cache that scripts/extract-version-data.py
+builds from the yugabyte-db source (`yb-model.py update-versions`). The cache is never committed:
+without it every answer below is "unknown" and the review asks for the release to be built.
 
 The engine never assumes one release behaves like another. For the customer's release it
 answers three questions:
@@ -30,6 +32,10 @@ def _load():
         except (OSError, ValueError):
             _DATA = {"tags": {}, "deployment_profiles": []}
     return _DATA
+
+
+def has_table():
+    return bool(_load().get("tags"))
 
 
 def vt(v):

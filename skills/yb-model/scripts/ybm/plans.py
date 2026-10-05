@@ -54,7 +54,7 @@ def summarize(plan_json, sch):
 def partial_hash_scan(scan, sch):
     """An Index Scan whose Index Cond does not bind every hash column of its index. The cost
     model can choose it, but DocDB cannot locate the rows by hash and reads the whole index
-    (see rules/observations.json, CAP001, for the oracle's per-release measurements)."""
+    (the CAP001 probe checks this on the customer's release)."""
     idx = sch.indexes.get(scan.get("index")) or next(
         (t.pk for t in sch.tables.values() if t.pk and t.pk.name == scan.get("index")), None)
     if idx is None or not idx.hash_cols or not scan.get("index_cond"):

@@ -10,7 +10,7 @@ fixtures/<name>/
   bundle/            what the skill under test sees: schema.sql + ybm_*.csv (collect.sql output)
   answer-key.json    planted or known defects, with "engine_match" and "judge" text, plus traps
   build.sh           optional: rebuilds bundle/ on a scratch container (synthetic fixtures)
-  setup.sql, load.sql, workload.sql   optional: inputs to build.sh
+  setup.sql, load.sql, gen_workload.py   optional: inputs to build.sh (the workload is generated)
 judge.md             grading brief for the blind judge
 prepare.sh           creates isolated run directories
 ```

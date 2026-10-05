@@ -75,6 +75,13 @@ skills/
       access-yba-k8s.md         # Reaching YSQL on a YBA-managed Kubernetes universe
       aeon-access.md            # SQL-layer access and analysis on YugabyteDB Aeon
       triage-snapshot.sql        # Cheap read-only SQL triage snapshot used by yb-performance-assessment
+  yb-model/
+    SKILL.md                  # YSQL schema / data-model review skill (runbook around a deterministic engine)
+    references/               # engine.md (outputs, passes), checks.md, intake.md, validation.md, critic.md
+    rules/                    # rules.json (rules + regress-test citations), inputs.json (what each input enables)
+    scripts/                  # yb-model.py CLI and ybm/ engine (Python 3.8+, standard library only), collect.sql, yb-lint.py
+evals/
+  yb-model/                   # yb-model evals: synthetic fixture with answer key, blind-judge rubric, planner oracle
 .claude-plugin/
   marketplace.json            # Claude Plugin Marketplace metadata (version, plugin definitions)
 .skills-lint.json             # Known exceptions for the static checks (each needs a rule and a reason)
@@ -179,6 +186,33 @@ The [static checks](#static-checks) catch structural problems. The rules here co
 3. The regression task from "Start from a failure" produces better output with the skill than without, and the PR says how it was checked.
 
 Sources: [Skill authoring best practices](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices) (Anthropic), [Agent Skills specification](https://agentskills.io/specification), [skill-creator](https://github.com/anthropics/skills/tree/main/skills/skill-creator) (anthropics/skills).
+
+## Skills that ship code: yb-model
+
+`yb-model` is the one skill here with executable code: a standard-library Python engine under
+`skills/yb-model/scripts/` with its tests and the evals under `evals/yb-model/`. Changes to it,
+including iterative rule improvements, follow these rules:
+
+- **Never commit version-specific caches.** `skills/yb-model/rules/versions.json` (release
+  facts, built by `yb-model.py update-versions` from the yugabyte-db source) and
+  `skills/yb-model/rules/observations.json` (written by `evals/yb-model/oracle.py`) are local
+  caches built for the releases being reviewed, and are in `.gitignore`. Commit the code that
+  builds them, never their output. The same applies to anything else derived per release:
+  replay plans, probe results, review outputs.
+- **Commit generators, not generated bulk data.** A fixture carries the frozen capture its tests
+  read (`bundle/`) plus the scripts that rebuild it (`build.sh`, `gen_workload.py`), not
+  thousands of generated lines.
+- **No release numbers or release behaviour in the rules.** A rule states a mechanism and cites
+  the regress test that pins it (`scripts/check-rule-refs.py`); per-release facts come from the
+  cache, and execution claims are verified per release by the rule's probe.
+- **No customer data.** Customer schemas, statistics and reviews go under
+  `evals/yb-model/fixtures-private/` (ignored). Nothing derived from them, including names,
+  numbers and commit messages, goes into a commit.
+- **Keep PRs reviewable.** The hosted reviewer stops at 3,000 changed lines; split larger
+  changes into stacked PRs, each building on the one before.
+- **Test before opening the PR:**
+  `python3 -m unittest discover -s skills/yb-model/scripts -p 'test_*.py'`. Tests must pass
+  without the caches above.
 
 ## Installation Commands (for reference)
 

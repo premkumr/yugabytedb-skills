@@ -258,33 +258,72 @@ class Metamorphic(unittest.TestCase):
 
 
 class Versions(unittest.TestCase):
-    def test_release_resolution_and_drift(self):
-        from ybm import versions
-        tag, note = versions.resolve("2025.2.5.2")
-        self.assertEqual(tag, "2025.2.5.2")
-        self.assertIsNone(note)
-        # Merge scan streams arrived within 2025.2.
-        self.assertFalse(versions.available("2025.2.0.0", "yb_max_merge_scan_streams"))
-        self.assertTrue(versions.available("2025.2.5.2", "yb_max_merge_scan_streams"))
-        # The cost model default depends on the deployment tool from 2025.2.
-        v, src, per = versions.setting("2025.2.5.2", "yb_enable_cbo")
-        self.assertIsNone(v)
-        self.assertEqual(sorted(set(per.values())), ["legacy_mode", "on"])
-        d = versions.drift("2025.1.0.0", "2026.1.1.2")
-        self.assertIn("yb_max_merge_scan_streams", d["settings"])
+    """Release handling against a synthetic table: the real one is a local cache, never
+    committed, so tests must not depend on it."""
 
-    def test_profiles_are_discovered_not_hand_written(self):
+    G = {"yb_enable_cbo": "legacy_mode", "yb_max_merge_scan_streams": None,
+         "yb_use_hash_splitting_by_default": "on"}
+    TABLE = {"tags": {
+        "9.1.0.0": {"gucs": dict(G), "anchors": {"CAP001": False}, "profiles": {}},
+        "9.1.2.0": {"gucs": dict(G, yb_max_merge_scan_streams="64"),
+                    "anchors": {"CAP001": True},
+                    "profiles": {"yugabyted": {"yb_enable_cbo": "on"}}},
+        "9.2.0.0": {"gucs": dict(G, yb_max_merge_scan_streams="64"),
+                    "anchors": {"CAP001": True},
+                    "profiles": {"yugabyted --enhance_pg_compatibility":
+                                 {"yb_use_hash_splitting_by_default": "off"}}}}}
+
+    def setUp(self):
         from ybm import versions
-        p = versions.profiles("2024.2.0.0")
-        # On 2024.2 yugabyted sets planner settings only under Enhanced PG Compatibility.
-        self.assertIn("yugabyted --enhance_pg_compatibility", p)
-        self.assertNotIn("yugabyted", p)
-        self.assertEqual(p["yugabyted --enhance_pg_compatibility"]
-                         ["yb_use_hash_splitting_by_default"], "off")
-        # So the default sharding is conditional on how the cluster was deployed.
-        v, _, per = versions.setting("2024.2.0.0", "yb_use_hash_splitting_by_default")
-        self.assertIsNone(v)
+        self.v, self.saved = versions, versions._DATA
+        versions._DATA = json.loads(json.dumps(self.TABLE))
+
+    def tearDown(self):
+        self.v._DATA = self.saved
+
+    def test_release_resolution_and_drift(self):
+        v = self.v
+        self.assertEqual(v.resolve("9.1.2.0"), ("9.1.2.0", None))
+        tag, note = v.resolve("9.1.3.1")
+        self.assertEqual(tag, "9.1.2.0")
+        self.assertIn("same line", note)
+        self.assertFalse(v.available("9.1.0.0", "yb_max_merge_scan_streams"))
+        self.assertTrue(v.available("9.1.2.0", "yb_max_merge_scan_streams"))
+        self.assertIs(v.pinned("9.1.0.0", "CAP001"), False)
+        d = v.drift("9.1.0.0", "9.1.2.0", rules=["CAP001"])
+        self.assertIn("yb_max_merge_scan_streams", d["settings"])
+        self.assertEqual(d["rules"], ["CAP001"])
+
+    def test_settings_conditional_when_deployment_tools_disagree(self):
+        val, _, per = self.v.setting("9.1.2.0", "yb_enable_cbo")
+        self.assertIsNone(val)
+        self.assertEqual(sorted(set(per.values())), ["legacy_mode", "on"])
+        val, _, per = self.v.setting("9.2.0.0", "yb_use_hash_splitting_by_default")
+        self.assertIsNone(val)
         self.assertEqual(sorted(set(per.values())), ["off", "on"])
+
+    def test_profiles_are_discovered_from_source(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "evd", os.path.join(HERE, "extract-version-data.py"))
+        evd = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(evd)
+        src = ("conf = ['yb_enable_cbo=on']\n"
+               "# Enhanced PG compatibility (enhance_pg_compatibility)\n"
+               "PG_PARITY_FLAGS = 'yb_use_hash_splitting_by_default=false'\n")
+        default, opt_in = evd._yugabyted_profiles(src)
+        self.assertEqual(default, {"yb_enable_cbo": "on"})
+        self.assertEqual(opt_in, {"yb_use_hash_splitting_by_default": "off"})
+
+    def test_review_without_a_release_cache_says_how_to_build_it(self):
+        self.v._DATA = {"tags": {}}
+        d = Preflight.make(self, {"schema.sql": "CREATE TABLE t (id int PRIMARY KEY);\n",
+                                  "ybm_meta.csv": "key,value\nversion,PostgreSQL 15-YB-9.3.0.0-b1\n"})
+        items = analyze.run(inputs.load(d))["open_items"]
+        miss = [o for o in items if o.startswith("RELEASE-DATA-MISSING")]
+        self.assertEqual(len(miss), 1)
+        self.assertIn("update-versions --repo", miss[0])
+        self.assertIn("ask the user first", miss[0])
 
     def test_no_release_numbers_in_rules(self):
         here = os.path.dirname(os.path.abspath(__file__))

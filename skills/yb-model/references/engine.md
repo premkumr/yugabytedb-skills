@@ -111,7 +111,8 @@ appear once the fixes are combined.
 ## 6. Releases and deployment tools
 
 No release number or release behaviour is written by hand in the engine or the rules. Release
-facts live in two generated files:
+facts live in two generated files. Both are local caches: they are built on the machine that
+runs reviews, for the releases being reviewed, and are never committed (`.gitignore`):
 
 - `rules/versions.json`, built by `scripts/extract-version-data.py` from the yugabyte-db
   source of every release tag (local checkout via `git show`, or GitHub for one release).

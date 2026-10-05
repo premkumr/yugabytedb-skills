@@ -374,7 +374,7 @@ def eval_path(idx, ops, shape, table, cbo):
         later = any(ops.get(_keyid(k), set()) & set(BIND_ANY_EQ + BIND_RANGE)
                     for k in idx.keys[1:])
         # DocDB can skip-scan a range-led key on a later bound column in both planner modes
-        # (see rules/observations.json, "engine:skip_scan").
+        # (checked by evals/yb-model/oracle.py; results stay in a local cache).
         if later and not hk:
             res["usable"] = True
             res["skip_scan"] = True
@@ -566,11 +566,20 @@ def run(bundle, plans=None, schema_override=None):
         open_items.append("Release: " + ps["release_note"] + ".")
     if bundle.version and ps["release"] != bundle.version and \
             versions_mod.vt(ps["release"] or "0")[:4] != versions_mod.vt(bundle.version)[:4]:
-        open_items.append("RELEASE-DATA-MISSING: %s is not in rules/versions.json, so release "
-                          "facts come from %s. To add it, run `yb-model.py update-versions "
-                          "--github --release %s` (fetches about 25 source files of that "
-                          "release from github.com; ask the user first), then review again." % (
-                              bundle.version, ps["release"] or "no release", bundle.version))
+        build = ("Build it with `yb-model.py update-versions --repo <yugabyte-db checkout> "
+                 "--release %s` (local, no network) or `yb-model.py update-versions --github "
+                 "--release %s` (fetches about 25 source files of that release from "
+                 "github.com; ask the user first), then review again." % (bundle.version,
+                                                                          bundle.version))
+        if not versions_mod.has_table():
+            open_items.append("RELEASE-DATA-MISSING: no release facts have been built on this "
+                              "machine yet (rules/versions.json is a local cache), so setting "
+                              "defaults, feature availability and test pinning for %s are "
+                              "unknown. %s" % (bundle.version, build))
+        else:
+            open_items.append("RELEASE-DATA-MISSING: %s is not in the local release cache, so "
+                              "release facts come from %s. %s" % (
+                                  bundle.version, ps["release"] or "no release", build))
     for name, per in sorted(ps["conditional"].items()):
         open_items.append("%s is not in the bundle and its default on %s depends on how the "
                           "cluster was deployed (%s). Findings that depend on it are "
