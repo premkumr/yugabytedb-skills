@@ -7,6 +7,10 @@ Contents: A) query pack · B) reading the results · C) config baseline · D) si
 statistics. Use this file for the live-cluster checks that remain: `EXPLAIN (ANALYZE,
 DIST)` on the target, parse-checking recommended DDL, and the sign-off gate.
 
+Everything here is read-only on the customer's cluster. **Never run recommended DDL there**
+(it includes `DROP INDEX`, primary-key swaps and index rebuilds). Parse-check it on a scratch
+instance of the same release, such as the replay container, or give it to the user to run.
+
 ---
 
 ## A. Query pack
@@ -43,8 +47,12 @@ FROM pg_stat_user_indexes s JOIN pg_index i ON s.indexrelid = i.indexrelid
 WHERE idx_scan = 0 AND NOT i.indisprimary AND NOT i.indisunique
 ORDER BY pg_relation_size(i.indexrelid) DESC;
 
--- A6. Live tablet counts per relation. Trust this, not the DDL file.
-SELECT table_name, count(*) AS tablets FROM yb_local_tablets GROUP BY 1 ORDER BY 2 DESC;
+-- A6. Tablet counts per relation, cluster-wide from the master catalog. Trust this, not the
+-- DDL file. (yb_local_tablets lists only the tablets with a peer on the node you are on.)
+SELECT n.nspname, c.relname, (yb_table_properties(c.oid)).num_tablets
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r', 'i', 'm') AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY 3 DESC;
 
 -- A7. Relation and index sizes
 SELECT relname,
@@ -150,8 +158,9 @@ without measurements is a structural review and must say so.
       leading-index column.
 - [ ] `pg_stat_user_indexes` reviewed before any index drop.
 - [ ] `EXPLAIN (ANALYZE, DIST)` run on every access pattern; plans match expectations.
-- [ ] Tablet counts verified in `yb_local_tablets`, not read from the DDL.
-- [ ] Every recommended DDL statement parse-checked on a live instance; version recorded.
+- [ ] Tablet counts verified with `yb_table_properties` (A6), not read from the DDL.
+- [ ] Every recommended DDL statement parse-checked on a scratch instance of the customer's
+      release (never on the customer's cluster); version recorded.
 - [ ] Tablet budget arithmetic done against node count and RAM, tombstones included.
 - [ ] `ANALYZE` run; plans re-checked without legacy hints.
 - [ ] Publications and `REPLICA IDENTITY` verified, if CDC is in scope.

@@ -88,8 +88,21 @@ def reconcile(plans, patterns, col, sch, rules, th, recon, wshift, shift, Findin
 
     vm = plans.get("version_match") or {}
     drifted = set((vm.get("drift") or {}).get("rules", []))
+    # On an image that is not the customer's release, confirming or refuting needs the
+    # differences between the two releases. Without release facts they are unknown.
+    drift_unknown = not vm.get("exact", True) and not vm.get("drift_known", True)
+    # Planner settings the bundle did not supply were assumed. A plan under assumed settings
+    # may confirm a finding, but never removes one: the finding moves to "disputed".
+    assumed = sorted(plans.get("assumed_settings") or {})
+    image = vm.get("image_release") or plans.get("version")
     label = "confirmed (replay)" if vm.get("exact", True) else \
-        "confirmed (replay on %s, nearest to %s)" % (vm.get("image_release"), vm.get("customer"))
+        "confirmed (replay on %s, nearest earlier release to %s)" % (image, vm.get("customer"))
+    if assumed:
+        label += "; planner settings assumed"
+    # What a replay on a different release shows without known differences is that release's
+    # behaviour, not necessarily the customer's.
+    caveat = "replayed on %s; differences to %s unknown" % (image, vm.get("customer")) \
+        if drift_unknown else None
     expect_seq = ("CAP001", "CAP002", "CAP003", "CAP040", "CAP021", "CAP031")
     for key in list(col.items.keys()):
         fnd = col.items[key]
@@ -121,6 +134,11 @@ def reconcile(plans, patterns, col, sch, rules, th, recon, wshift, shift, Findin
             verdicts.append((pid, ok, scans))
         if not verdicts:
             continue
+        if drift_unknown:
+            fnd.replay = ("not used: replay ran on %s, not the customer's %s, and the "
+                          "differences between the two releases are unknown (no release facts "
+                          "cached)" % (plans.get("version"), vm.get("customer")))
+            continue
         if fnd.rule in drifted:
             fnd.replay = ("not used: this rule's tested behaviour differs between %s and the "
                           "replay image %s" % (vm.get("customer_release"),
@@ -131,10 +149,14 @@ def reconcile(plans, patterns, col, sch, rules, th, recon, wshift, shift, Findin
             fnd.replay = "; ".join("%s: %s" % (pid, _scan_txt(sc)) for pid, v, sc in verdicts
                                    if v is True)
         elif all(v is False for _, v, _ in verdicts):
+            plan_txt = "; ".join("%s: %s" % (pid, _scan_txt(sc)) for pid, _, sc in verdicts)
+            if assumed:
+                fnd.disputed = ("replay under assumed planner settings (%s) chose a plan that "
+                                "contradicts this finding: %s" % (", ".join(assumed), plan_txt))
+                fnd.replay = "disputed: " + plan_txt
+                continue
             recon.append({"finding": fnd.rule, "object": fnd.obj, "patterns": fnd.patterns,
-                          "outcome": "refuted by replay",
-                          "plan": "; ".join("%s: %s" % (pid, _scan_txt(sc))
-                                            for pid, _, sc in verdicts)})
+                          "outcome": "refuted by replay", "plan": plan_txt})
             del col.items[key]
         else:
             fnd.replay = "planner chose another path: " + "; ".join(
@@ -149,7 +171,7 @@ def reconcile(plans, patterns, col, sch, rules, th, recon, wshift, shift, Findin
                 if not any(k[0] in ("CAP001", "CAP002", "CAP003", "CAP040", "CAP021", "CAP031")
                            and pid in v.patterns and v.table == s["table"]
                            for k, v in col.items.items()):
-                    col.add(Finding("PLN001", shift("high", wshift[w]), "confirmed (replay)",
+                    col.add(Finding("PLN001", shift("high", wshift[w]), label,
                                     "%s scan of %s" % (pid, s["relation"]),
                                     "%s: replayed plan scans all of %s (~%d rows injected)%s." % (
                                         pid, s["relation"], rows,
@@ -158,11 +180,11 @@ def reconcile(plans, patterns, col, sch, rules, th, recon, wshift, shift, Findin
                                     [pid], table=s["table"]))
         if facts["sort_under_limit"] and not any(
                 k[0] in ("CAP010", "CAP011") and pid in v.patterns for k, v in col.items.items()):
-            col.add(Finding("PLN002", shift("medium", wshift[w]), "confirmed (replay)",
+            col.add(Finding("PLN002", shift("medium", wshift[w]), label,
                             "%s sort" % pid, "%s: replayed plan sorts before LIMIT." % pid, [pid]))
         if facts["appends"] and max(facts["appends"]) > 1 and not any(
                 k[0] == "CAP030" and pid in v.patterns for k, v in col.items.items()):
-            col.add(Finding("PLN003", shift("high", wshift[w]), "confirmed (replay)",
+            col.add(Finding("PLN003", shift("high", wshift[w]), label,
                             "%s append" % pid, "%s: replayed plan appends %d partitions." % (
                                 pid, max(facts["appends"])), [pid]))
     # Patterns the release rejected. Untyped parameters are a replay artefact (the application's
@@ -185,8 +207,16 @@ def reconcile(plans, patterns, col, sch, rules, th, recon, wshift, shift, Findin
         col.add(Finding("PLN005", shift("high", wshift[weights.get(p["id"], "UNRANKED")]),
                         label, "%s error" % p["id"], "%s fails on replay: %s" % (p["id"], err),
                         [p["id"]]))
+    for f in col.items.values():
+        replayed = f.rule.startswith("PLN") or (f.rule == "CAP060" and f.replay)
+        if replayed and caveat and caveat not in f.caveats:
+            f.caveats.append(caveat)
+        if f.rule.startswith("PLN") and assumed and "planner settings assumed" not in f.caveats:
+            f.caveats.append("planner settings assumed")
     return {"version": plans.get("version"), "mode": plans.get("mode"),
-            "unplannable": artefacts,
+            "unplannable": artefacts, "drift_unknown": drift_unknown,
+            "disputed": sorted(f.rule + " " + f.obj for f in col.items.values()
+                               if getattr(f, "disputed", None)),
             "probes": {k: {"verdict": v["verdict"], "detail": v["detail"]}
                        for k, v in (plans.get("probes") or {}).items()},
             "version_match": vm, "assumed_settings": plans.get("assumed_settings"),

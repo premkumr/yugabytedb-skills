@@ -101,7 +101,7 @@
     },
     {
       "name": "yb-model",
-      "description": "Review/validate a YugabyteDB YSQL schema for distribution, sharding, indexing, partitioning, tablet-split and write-path defects, with a DDL linter and an independent second pass. Use whenever the user mentions YugabyteDB, YSQL, DocDB, tablets, hash or range sharding, hot shards, tablet skew, redundant or unused indexes, or Voyager, or pastes DDL, a pg_dump, pg_stats, pg_stat_statements or a tablet report and asks whether it looks right, even if they never say the word review. Also use when someone types yb-model.",
+      "description": "Complete review of an existing YugabyteDB YSQL schema and data model: primary keys and sharding, indexes, partitions, tablet splits, data quality and how the workload uses them, judged against every piece of evidence available (the schema dump, pg_stats, pg_stat_statements, row counts, planner settings, index usage and tablet counts). Use when the user asks to review, validate or audit a YSQL schema or data model, or shares a schema dump or statistics bundle and asks whether it holds up. Triggers on schema review, data model review, ysql_dump, pg_stats, pg_stat_statements, collect.sql, hot shards, tablet skew, unused or redundant indexes, yb-model. For writing a new schema, application code or a migration plan, use the ysql skill instead.",
       "source": "./",
       "strict": false,
       "skills": [

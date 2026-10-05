@@ -8,7 +8,9 @@ checkout, per release tag, without checking anything out.
 For each rule and anchor it prints which tags contain the anchor. An anchor missing from the
 newest tag means the test changed and the rule's citation (and possibly the rule) needs a
 look. An anchor missing from older tags marks the release that introduced the behaviour.
-Exit code 1 if any anchor is missing from the newest tag given.
+Exit code 1 if any anchor is missing from the newest tag given, or if a rule that claims
+planner or execution behaviour (kind "capability" or "plan") cites no test. Statistics,
+workload, configuration and safety rules are arithmetic on the bundle and cite none.
 """
 
 import argparse
@@ -36,6 +38,12 @@ def main():
     with open(os.path.join(here, "..", "rules", "rules.json")) as fh:
         rules = json.load(fh)["rules"]
     cache, rows, bad = {}, [], 0
+    uncited = sorted(rid for rid, r in rules.items()
+                     if r.get("kind") in ("capability", "plan") and not r.get("test"))
+    for rid in uncited:
+        print("%s: claims planner behaviour (kind %s) but cites no regress test" % (
+            rid, rules[rid]["kind"]), file=sys.stderr)
+    bad += len(uncited)
     for rid in sorted(rules):
         for ref in rules[rid].get("test", []):
             present = []

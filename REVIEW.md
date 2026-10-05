@@ -1,6 +1,6 @@
 # REVIEW.md — what to check when reviewing this repository
 
-This repository contains **agent skills**, not application code. Every file under `skills/` is Markdown that a coding agent loads and acts on. The only executable code is `scripts/check_skills.py` and its tests.
+This repository contains **agent skills**, not application code. Almost every file under `skills/` is Markdown that a coding agent loads and acts on. The executable code is `scripts/check_skills.py` and its tests, and the `yb-model` skill's engine (`skills/yb-model/scripts/`, with evals under `evals/yb-model/`); see [Reviewing the yb-model engine](#reviewing-the-yb-model-engine).
 
 That changes what a defect is. A wrong package name here is not a typo — an agent will run `pip install` on it. A parameter spelled the way a different driver spells it produces code that connects but silently loses the behaviour the user asked for. Review for **what an agent will do after reading the text**, not for prose style.
 
@@ -42,6 +42,16 @@ Known exceptions live in `.skills-lint.json`, each with a stated reason, and are
 - A conflict guarded in one direction only. If skill A warns about replacing B's dependency, B needs the mirror.
 - Anything that would make an agent take a destructive or irreversible action without surfacing the choice to the user.
 - Documentation in `AGENTS.md` that no longer matches what `scripts/check_skills.py` does. These drift, and the doc is what contributors read.
+
+## Reviewing the yb-model engine
+
+`yb-model` runs a deterministic Python engine and the agent reports its output verbatim, so an engine bug reaches the user as a confident finding. Beyond the points above, check:
+
+- **The report says only what the code checked.** A sentence in `report.py`, `SKILL.md` or `references/engine.md` that claims more than the code does (a check that covers fewer cases, a guarantee that depends on an input that may be missing) is a defect.
+- **Missing inputs degrade honestly.** Without pg_settings, release facts, statistics or a workload, a rule must be muted, weakened with a caveat, or made conditional; never decided by a default the customer may not run. The same holds for replay and probes: under assumed settings they may dispute a finding, not remove it.
+- **No finding without its basis.** Rules that claim planner or execution behaviour cite a regress test (`check-rule-refs.py` enforces this); the rest must be arithmetic on the bundle.
+- **Recommended DDL never loses a guarantee.** Uniqueness, ON CONFLICT targets and plans are checked by the safety pass; a change that bypasses it, or DDL an agent would run on the customer's cluster, is a defect.
+- **The `AGENTS.md` rules for this skill:** no version-specific caches or generated bulk data committed, no release facts in the rules, no customer data, tests pass without the caches (`python3 -m unittest discover -s skills/yb-model/scripts -p 'test_*.py'`).
 
 ## Conventions for skill content
 

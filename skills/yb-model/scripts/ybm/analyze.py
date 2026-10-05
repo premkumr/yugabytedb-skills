@@ -16,10 +16,10 @@ from . import sqlshape
 SEV = ["critical", "high", "medium", "low", "info"]
 
 THRESHOLDS = {
-    "hot_cum_share": 0.80,      # patterns covering the first 80% of total time are HOT ...
+    "hot_cum_share": 0.80,      # patterns covering the first 80% of analysable time are HOT ...
     "hot_max": 25,              # ... capped at 25 patterns
     "hot_calls_rank": 10,       # the 10 most-called patterns are HOT regardless of time
-    "warm_share": 0.001,        # >= 0.1% of total time or calls is WARM, otherwise COLD
+    "warm_share": 0.001,        # >= 0.1% of analysable time or calls is WARM, otherwise COLD
     "null_frac_flag": 0.01,     # STA001 fires at >= 1% NULLs on a hash lead ...
     "null_frac_high": 0.10,     # ... high at >= 10% or >= null_rows_high rows
     "null_rows_high": 1e6,
@@ -42,13 +42,19 @@ THRESHOLDS = {
     "mcv_rows_medium": 1e7,     # ... medium at >= 10M (one hash code is never split across
     "mcv_rows_high": 1e8,       # ... tablets), high at >= 100M
     "all_null": 0.999,          # STA006: column is (almost) entirely NULL
-    "zero_rows_calls": 10000,
-    "miss_rate_rows": 0.05,     # WRK005: <= 0.05 rows per call (>= 95% of calls find nothing)   # WRK005: SELECT returning 0 rows over >= 10k calls
-    "plan_share": 0.30,
+    "zero_rows_calls": 10000,   # WRK005: a SELECT with >= 10k calls ...
+    "miss_rate_rows": 0.05,     # ... returning <= 0.05 rows per call (>= 95% of calls miss)
+    "plan_share": 0.30,         # WRK006: planning >= 30% of plan + execution time
     "dml_match_rate": 0.5,      # WRK009: UPDATE/DELETE changing <= 0.5 rows per call
     "fanout_rows": 1000,        # WRK007: SELECT returning >= 1000 rows per call
     "include_all_cols": 8,      # CAP020: SELECT * is coverable by INCLUDE on tables this narrow
-    "sentinel_share": 0.05,     # STA007: one value >= 5% of an otherwise near-unique column         # WRK006: planning >= 30% of plan + execution time
+    "sentinel_share": 0.05,     # STA007: one value >= 5% of an otherwise near-unique column,
+    "near_unique_nd": -0.3,     # ... where "near-unique" is n_distinct below -0.3
+    "date_sentinel_share": 0.01,  # STA007: a placeholder date holding >= 1% of rows
+    "well_distributed_nd": 100000,  # "sound": a hash lead with >= 100k distinct values
+    "corr_unordered": 0.3,      # "sound": |correlation| < 0.3 on a range lead
+    "min_ordered_nd": 100,      # STA004 ignores columns with < 100 distinct values
+    "fanout_factor": 3,         # WRK007 names skew when rows per call >= 3x the expected
 }
 
 MONOTONIC_NAME = re.compile(r"^(.*_)?(created|updated|inserted|modified|materialized|"
@@ -171,6 +177,7 @@ class Finding:
         self.measured = None
         self.caveats = []
         self.verified = None
+        self.disputed = None  # why replay or a probe under assumed settings disagreed
 
     def key(self):
         return (self.rule, self.obj)
@@ -187,8 +194,13 @@ class Finding:
             pin = versions.pinned(release, self.rule)
             if pin is False:
                 conf += "; not pinned by tests on %s" % release
+        # Planner-behaviour rules cite the regress test that pins them. The others are
+        # arithmetic on the bundle's own statistics and workload, so no test can pin them.
+        basis = "regress test" if r.get("test") else "computed from the bundle"
         return {"rule": self.rule, "severity": self.severity, "confidence": conf,
-                "caveats": list(self.caveats), "pinned_on_release": pin, "section": r.get("section", "schema"),
+                "caveats": list(self.caveats), "pinned_on_release": pin, "basis": basis,
+                "section": "disputed" if self.disputed else r.get("section", "schema"),
+                "disputed": self.disputed,
                 "object": self.obj, "table": self.table, "index": self.index,
                 "patterns": self.patterns, "title": r.get("title", self.rule),
                 "fact": self.fact, "mechanism": r.get("mechanism"),
@@ -239,20 +251,33 @@ def _is_catalog(q):
                           r"pg_attribute|pg_settings|yb_local_tablets|pg_database|pg_type)\b", ql))
 
 
-def build_patterns(bundle, schema):
+def build_patterns(bundle, schema, dropped=None):
+    """Access patterns. With pg_stat_statements, `time_share` / `call_share` are shares of all
+    captured statements, as the report quotes them. HOT / WARM / COLD rank the analysable
+    statements among themselves, so session, catalog and other-schema statements do not move
+    the weights. Statements that are not analysed are appended to `dropped` with the reason."""
     pats = []
     if bundle.pss:
         rows = []
         for r in bundle.pss:
             if _is_catalog(r["query"]):
-                continue
-            shape = sqlshape.analyze(r["query"], schema)
-            tabs = sorted({t for s in sqlshape.flatten(shape) for t in s.tables
-                           if t in schema.tables})
-            if shape.kind == "utility" or not tabs:
-                continue
-            rows.append((r, shape, tabs))
+                reason = "catalog or monitoring query"
+            else:
+                shape = sqlshape.analyze(r["query"], schema)
+                tabs = sorted({t for s in sqlshape.flatten(shape) for t in s.tables
+                               if t in schema.tables})
+                if shape.kind == "utility":
+                    reason = "utility or session statement"
+                elif not tabs:
+                    reason = "no table of the schema"
+                else:
+                    rows.append((r, shape, tabs))
+                    continue
+            if dropped is not None:
+                dropped.append((reason, r))
         # fsum: exact, so totals do not drift between Python versions.
+        all_ms = math.fsum(r["total_ms"] for r in bundle.pss) or 1.0
+        all_calls = math.fsum(r["calls"] for r in bundle.pss) or 1.0
         tot_ms = math.fsum(r["total_ms"] for r, _, _ in rows) or 1.0
         tot_calls = math.fsum(r["calls"] for r, _, _ in rows) or 1.0
         rows.sort(key=lambda x: (-x[0]["total_ms"], -x[0]["calls"], x[0]["queryid"]))
@@ -260,7 +285,7 @@ def build_patterns(bundle, schema):
         call_rank = {id(x[0]): i for i, x in enumerate(by_calls)}
         cum = 0.0
         for i, (r, shape, tabs) in enumerate(rows):
-            share = round(r["total_ms"] / tot_ms, 6)
+            share = round(r["total_ms"] / tot_ms, 6)    # among analysable statements
             cshare = round(r["calls"] / tot_calls, 6)
             if (cum < THRESHOLDS["hot_cum_share"] and i < THRESHOLDS["hot_max"]) or \
                     call_rank[id(r)] < THRESHOLDS["hot_calls_rank"]:
@@ -273,7 +298,8 @@ def build_patterns(bundle, schema):
             pats.append({"id": "P%d" % (i + 1), "source": "pg_stat_statements",
                          "queryid": r["queryid"], "query": r["query"], "calls": r["calls"],
                          "total_ms": r["total_ms"], "mean_ms": r["mean_ms"], "rows": r["rows"],
-                         "time_share": share, "call_share": cshare, "weight": w,
+                         "time_share": round(r["total_ms"] / all_ms, 6),
+                         "call_share": round(r["calls"] / all_calls, 6), "weight": w,
                          "kind": shape.kind, "tables": tabs, "shape": shape, "pss": r})
     elif bundle.queries_sql:
         from .sqltok import tokenize, split_statements
@@ -576,10 +602,14 @@ def run(bundle, plans=None, schema_override=None):
                               "machine yet (rules/versions.json is a local cache), so setting "
                               "defaults, feature availability and test pinning for %s are "
                               "unknown. %s" % (bundle.version, build))
-        else:
+        elif ps["release"]:
             open_items.append("RELEASE-DATA-MISSING: %s is not in the local release cache, so "
-                              "release facts come from %s. %s" % (
-                                  bundle.version, ps["release"] or "no release", build))
+                              "release facts come from the nearest earlier release, %s. %s" % (
+                                  bundle.version, ps["release"], build))
+        else:
+            open_items.append("RELEASE-DATA-MISSING: %s is older than every release in the "
+                              "local cache, so its release facts are unknown (a newer release "
+                              "is never used in its place). %s" % (bundle.version, build))
     for name, per in sorted(ps["conditional"].items()):
         open_items.append("%s is not in the bundle and its default on %s depends on how the "
                           "cluster was deployed (%s). Findings that depend on it are "
@@ -587,7 +617,7 @@ def run(bundle, plans=None, schema_override=None):
                               name, ps["release"], "; ".join("%s: %s" % (k, v)
                                                             for k, v in sorted(per.items()))))
     cov = versions_mod.oracle_coverage(ps["release"])
-    if ps["release"] and cov is None:
+    if ps["release"] and cov is None and versions_mod.has_observations():
         near = versions_mod.oracle_nearest(ps["release"])
         open_items.append("The planner model has not been checked by the oracle on %s%s; "
                           "access-path findings rely on its regress-test citations." % (
@@ -599,7 +629,21 @@ def run(bundle, plans=None, schema_override=None):
     for note in sch.parse_notes:
         open_items.append("DDL parse: " + note)
 
-    patterns = build_patterns(bundle, sch)
+    dropped = []
+    patterns = build_patterns(bundle, sch, dropped)
+    if dropped:
+        all_ms = math.fsum(r["total_ms"] for r in bundle.pss) or 1.0
+        by = {}
+        for reason, r in dropped:
+            n, ms = by.get(reason, (0, 0.0))
+            by[reason] = (n + 1, ms + r["total_ms"])
+        open_items.append("%d of %d pg_stat_statements entries (%.1f%% of statement time) are "
+                          "not analysed as access patterns: %s. Shares quoted in this review "
+                          "are of all statement time." % (
+                              len(dropped), len(bundle.pss),
+                              100 * math.fsum(r["total_ms"] for _, r in dropped) / all_ms,
+                              "; ".join("%s: %d (%.1f%%)" % (k, n, 100 * ms / all_ms)
+                                        for k, (n, ms) in sorted(by.items()))))
     chosen_by = {}   # index name -> [pattern ids]
 
     for pat in patterns:
@@ -976,7 +1020,8 @@ def run(bundle, plans=None, schema_override=None):
                                             idx.name, tname, lead.col, _fmt(nd),
                                             (" over ~%s rows" % _fmt(rows)) if rows else ""),
                                         table=tname, index=idx.name))
-                    elif nd is not None and nd >= 100000 and (st["null_frac"] or 0) < \
+                    elif nd is not None and nd >= THRESHOLDS["well_distributed_nd"] and \
+                            (st["null_frac"] or 0) < \
                             THRESHOLDS["null_frac_flag"] and \
                             (not st["mcf"] or st["mcf"][0] < THRESHOLDS["mcv_medium"]):
                         sound.append("%s: hash lead %s.%s is well distributed (~%s distinct, "
@@ -1064,7 +1109,7 @@ def run(bundle, plans=None, schema_override=None):
                                             "; write activity was not captured, so this applies "
                                             "only if rows are still inserted in that order"),
                                         table=tname, index=idx.name, fix=s4fix, ddl=s4ddl))
-                    elif abs(corr) < 0.3:
+                    elif abs(corr) < THRESHOLDS["corr_unordered"]:
                         sound.append("%s: range lead %s.%s is not insertion-ordered "
                                      "(correlation %.2f)." % (idx.name, tname, lead.col, corr))
             if idx.unique and not idx.is_pk and st is not None and (st["null_frac"] or 0) > 0 \
@@ -1164,7 +1209,7 @@ def run(bundle, plans=None, schema_override=None):
                 except Exception:
                     vals = None
                 ndv = st.get("n_distinct")
-                if not vals and ndv is not None and ndv < -0.3 and \
+                if not vals and ndv is not None and ndv < THRESHOLDS["near_unique_nd"] and \
                         st["mcf"][0] >= THRESHOLDS["sentinel_share"]:
                     col.add(Finding("STA007", "low", "probable", "%s.%s" % (tname, c),
                                     "%s.%s is otherwise near-unique (n_distinct %.2f) yet one "
@@ -1173,7 +1218,7 @@ def run(bundle, plans=None, schema_override=None):
                                     evidence="SELECT %s, count(*) FROM %s GROUP BY 1 ORDER BY 2 "
                                              "DESC LIMIT 3" % (c, tname)))
                 if vals and re.match(r"^(0001-01-01|1970-01-01|1900-01-01|9999-12-31)", vals[0]) \
-                        and st["mcf"][0] >= 0.01:
+                        and st["mcf"][0] >= THRESHOLDS["date_sentinel_share"]:
                     col.add(Finding("STA007", "low", "confirmed", "%s.%s" % (tname, c),
                                     "%s.%s: %.1f%% of rows hold the sentinel value %s." % (
                                         tname, c, 100 * st["mcf"][0], vals[0]), table=tname))
@@ -1300,7 +1345,8 @@ def run(bundle, plans=None, schema_override=None):
                                 p["id"], _fmt(rows / calls), t,
                                 ("; the column's cardinality predicts ~%s, so calls concentrate "
                                  "on the heaviest values" % _fmt(expected))
-                                if expected and rows / calls >= 3 * expected else
+                                if expected and rows / calls >= THRESHOLDS["fanout_factor"] *
+                                expected else
                                 ("; ~%s expected from cardinality" % _fmt(expected))
                                 if expected else ""),
                             [p["id"]], table=t))
@@ -1455,10 +1501,15 @@ def run(bundle, plans=None, schema_override=None):
                       and bundle.tablets.get(n, 0) == 1]
             if single:
                 ww = write_weight.get(tname)
-                col.add(Finding("SPL001", "medium" if ww == "HOT" else "low", "confirmed", tname,
-                                "Still on one tablet at >= %s rows: %s." % (
+                local = not bundle.tablets_cluster_wide
+                col.add(Finding("SPL001", "medium" if ww == "HOT" else "low",
+                                "probable" if local else "confirmed", tname,
+                                "Still on one tablet at >= %s rows: %s.%s" % (
                                     _fmt(THRESHOLDS["split_rows"]),
-                                    ", ".join("%s (~%s rows)" % (n, _fmt(r)) for n, r in single)),
+                                    ", ".join("%s (~%s rows)" % (n, _fmt(r)) for n, r in single),
+                                    " (tablet count from yb_local_tablets, which lists only the "
+                                    "tablets on one node; re-collect with collect.sql for "
+                                    "cluster-wide counts)" if local else ""),
                                 table=tname))
     if bundle.pss:
         since = bundle.meta.get("postmaster_start")
@@ -1704,7 +1755,7 @@ def _few_values(t, col, st, rows, idx):
     if idx.where and re.search(r"\b%s\s*=" % re.escape(col), idx.where):
         return True
     nd = n_distinct_abs(st, rows) if st else None
-    return nd is not None and nd < 100
+    return nd is not None and nd < THRESHOLDS["min_ordered_nd"]
 
 
 def _key_inferred(sch, f):

@@ -1,10 +1,13 @@
 """Fixpoint check: the engine must agree with itself after its own advice is applied.
 
-1. Review the schema.
+1. Start from the review as reported (its final findings and DDL, after replay and probes),
+   or, without one, a static review of the schema.
 2. Apply every recommended DDL (the same model the safety pass uses).
-3. Review the changed schema. Each finding that carried DDL must be gone, no new finding at
-   medium or above may appear, and the safety pass must have nothing to warn about.
-4. Apply the second round's DDL and review again: nothing may change.
+3. Review the changed schema statically (replay cannot re-measure a simulated schema). Each
+   schema finding that carried DDL must be gone, no new schema finding at medium or above may
+   appear (workload, plan and safety findings describe the workload as measured and are not
+   re-checked), and the safety pass must have nothing to warn about.
+4. Apply the second round's DDL and review again: no new schema finding at medium or above.
 
 It needs no answer key, so it runs on every fixture, including private customer bundles.
 """
@@ -31,9 +34,11 @@ def _serious(res):
             if f["severity"] in ("critical", "high", "medium")}
 
 
-def check(bundle):
+def check(bundle, final=None):
     sch0 = analyze.build_schema(bundle)
-    r1 = analyze.run(bundle, schema_override=sch0)
+    r1 = final if final is not None else analyze.run(bundle, schema_override=sch0)
+    if final is not None:  # disputed findings are not recommended, so their DDL is not applied
+        r1 = dict(r1, findings=[f for f in r1["findings"] if f.get("section") != "disputed"])
     sch1 = safety.apply(sch0, _changes(r1))
     r2 = analyze.run(bundle, schema_override=sch1)
     sch2 = safety.apply(sch1, _changes(r2))

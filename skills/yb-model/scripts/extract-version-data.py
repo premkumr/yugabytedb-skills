@@ -70,6 +70,8 @@ def onoff(v):
 
 
 class GitSource:
+    complete = True  # git grep searches the whole tree: "not found" means absent
+
     def __init__(self, repo):
         self.repo = repo
 
@@ -99,8 +101,12 @@ class GitSource:
 
 
 class GitHubSource:
-    """Reads single files of one tag from GitHub. grep() only searches the files that a
-    previous git extraction recorded in source_paths, because raw GitHub has no search."""
+    """Reads single files of one tag from GitHub. Raw GitHub has no search, so grep() only
+    searches a fixed list of files: DEFAULT_SOURCE_PATHS merged with the files earlier git
+    extractions found facts in. A fact outside those files is missed, so callers must treat
+    "not found" as unverified, not as absent."""
+
+    complete = False
 
     def __init__(self, paths):
         self.paths = paths
@@ -241,7 +247,19 @@ def profiles(src, tag, paths):
     got = _assignments(t for _, t in hits)
     if got:
         out["YBA new universe"] = got
+    elif not src.complete:
+        # GitHub runs search a fixed file list; YBA may set these elsewhere on this release.
+        out["YBA new universe"] = "unverified"
     return out
+
+
+def merge_paths(*maps):
+    """Union of {pathspec: [files]} maps, per key, so no run loses another run's files."""
+    out = {}
+    for m in maps:
+        for k, v in m.items():
+            out.setdefault(k, set()).update(v)
+    return {k: sorted(v) for k, v in sorted(out.items())}
 
 
 def main():
@@ -264,7 +282,7 @@ def main():
     if args.github:
         if not args.release:
             ap.error("--github needs --release")
-        sp = {k: v for k, v in (data.get("source_paths") or DEFAULT_SOURCE_PATHS).items()}
+        sp = merge_paths(DEFAULT_SOURCE_PATHS, data.get("source_paths") or {})
         src = GitHubSource(sp)
         tags = ["v" + r.lstrip("v") for r in args.release]
     elif args.repo:
@@ -285,8 +303,7 @@ def main():
                                  "profiles": profiles(src, tag, paths),
                                  "source": "github" if args.github else "git"}
     if not args.github:
-        data["source_paths"] = {k: sorted(v) for k, v in sorted(paths.items())} or \
-            data.get("source_paths", {})
+        data["source_paths"] = merge_paths(data.get("source_paths") or {}, paths)
     data.pop("deployment_profiles", None)
     data["source"] = "yugabyte-db release tags; regenerate with extract-version-data.py"
     with open(out, "w") as fh:

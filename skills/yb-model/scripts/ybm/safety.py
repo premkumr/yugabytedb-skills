@@ -198,6 +198,8 @@ def merge_replacements(sch, col):
     by_target = {}
     for key in sorted(col.items):
         f = col.items[key]
+        if getattr(f, "disputed", None):
+            continue  # not recommended: replay disputed it
         chs = changes_of(f.ddl)
         drops = [c[1] for c in chs if c[0] == "drop"]
         creates = [c[1] for c in chs if c[0] == "create"]
@@ -283,6 +285,8 @@ def check(sch, patterns, col, an, ps, bundle, Finding):
     all_changes = []
     for key in sorted(col.items, key=lambda k: (k[0], k[1])):
         f = col.items[key]
+        if getattr(f, "disputed", None):
+            continue  # not recommended: replay disputed it
         chs = changes_of(f.ddl)
         if not chs:
             continue
@@ -332,7 +336,8 @@ def check(sch, patterns, col, an, ps, bundle, Finding):
             worst = min((["HOT", "UNRANKED", "WARM", "COLD"].index(r["weight"] or "COLD")
                          for r in regs), default=1)
             sev = ["high", "high", "medium", "low"][worst]
-            tiny = regs and all((bundle.reltuples.get(r["table"]) or 1e9) < 1e4 for r in regs)
+            tiny = regs and all((bundle.reltuples.get(r["table"]) or 1e9) <
+                                an.THRESHOLDS["tiny_rows"] for r in regs)
             if tiny:
                 sev = "info"
                 row["checks"].append("affected tables are under 10k rows, so the cost is small")

@@ -23,7 +23,9 @@
 
 \copy (SELECT schemaname, relname, seq_scan, seq_tup_read, idx_scan, n_tup_ins, n_tup_upd, n_tup_del, n_live_tup FROM pg_stat_user_tables WHERE schemaname NOT IN ('pg_catalog', 'information_schema') AND schemaname NOT LIKE 'pg\_%' ORDER BY relname) TO 'ybm_table_usage.csv' CSV HEADER
 
-\copy (SELECT table_name, count(*) AS tablets FROM yb_local_tablets GROUP BY table_name ORDER BY table_name) TO 'ybm_tablets.csv' CSV HEADER
+-- Tablet counts from the master catalog (cluster-wide). yb_local_tablets would list only the
+-- tablets with a peer on the node this session is connected to.
+\copy (SELECT n.nspname AS schemaname, c.relname, (yb_table_properties(c.oid)).num_tablets AS num_tablets FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg\_%' AND c.relkind IN ('r', 'i', 'm') ORDER BY n.nspname, c.relname) TO 'ybm_tablets.csv' CSV HEADER
 
 -- Full statement text matters: a truncated WHERE clause cannot be mapped to an index.
 \copy (SELECT * FROM pg_stat_statements WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())) TO 'ybm_pss.csv' CSV HEADER

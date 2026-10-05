@@ -10,7 +10,8 @@ A bundle is a directory. Every file is optional except the schema:
   ybm_table_usage.csv   pg_stat_user_tables
   ybm_settings.csv      pg_settings name, setting
   ybm_meta.csv          version, colocated, postmaster start, stats reset
-  ybm_tablets.csv       table_name, tablets
+  ybm_tablets.csv       schemaname, relname, num_tablets (yb_table_properties: cluster-wide);
+                        older captures: table_name, tablets (yb_local_tablets: one node only)
 Columns are matched by name, so extra columns are ignored and older releases that lack some
 columns still load.
 """
@@ -98,6 +99,7 @@ class Bundle:
         self.settings = {}     # name -> setting
         self.meta = {}
         self.tablets = {}      # relname -> int
+        self.tablets_cluster_wide = True  # False for a yb_local_tablets (one node) capture
         self.present = []
         self.declared_complete = False  # queries.sql says no other statement touches the schema
 
@@ -209,4 +211,8 @@ def _load_tables(b, path):
     if p:
         b.present.append(os.path.basename(p))
         for r in _rows(p):
-            b.tablets[r["table_name"].lower()] = int(_f(r.get("tablets"), 0) or 0)
+            if "num_tablets" in r:
+                b.tablets[r["relname"].lower()] = int(_f(r.get("num_tablets"), 0) or 0)
+            else:  # yb_local_tablets lists only the tablets with a peer on one node
+                b.tablets_cluster_wide = False
+                b.tablets[r["table_name"].lower()] = int(_f(r.get("tablets"), 0) or 0)

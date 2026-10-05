@@ -2,16 +2,21 @@
 builds from the yugabyte-db source (`yb-model.py update-versions`). The cache is never committed:
 without it every answer below is "unknown" and the review asks for the release to be built.
 
-The engine never assumes one release behaves like another. For the customer's release it
-answers three questions:
+For the customer's release the engine asks three questions:
 
 1. What are the planner settings when the bundle does not include pg_settings? The compiled
    default, unless a deployment tool overrides it (yugabyted, or YBA for new universes). When
-   the tools disagree the setting is *conditional* and findings that depend on it say so.
+   the tools disagree, or a tool's overrides could not be verified, the setting is
+   *conditional* and findings that depend on it say so.
 2. Does a feature a fix relies on exist on this release (for example merge scan streams)?
 3. Is a rule's behaviour pinned by a regress test on this release?
 
 and, for replay on a different image, which of those answers differ between the two releases.
+
+When the cache has no entry for the customer's release, the answers come from the nearest
+*earlier* release in the cache, never a newer one: a newer release may already fix what the
+customer's release still does. The open items say which release stood in. A release older than
+everything in the cache has no stand-in, and its facts are unknown.
 """
 
 import json
@@ -49,26 +54,33 @@ def line(v):
 
 
 def resolve(version):
-    """The newest known release at or below `version`, and a note when the match is loose."""
+    """(tag, note): the customer's release, or the nearest earlier release in the cache, with a
+    note when it is a stand-in. Never a newer release; None when nothing earlier is cached."""
     if not version:
         return None, "release unknown"
     tags = sorted(_load()["tags"], key=vt)
     if not tags:
-        return None, "no version table"
+        return None, "no release facts cached"
     want = vt(version)
     below = [t for t in tags if vt(t) <= want]
     if not below:
-        return tags[0], "older than the version table (%s); using %s" % (version, tags[0])
+        return None, ("release %s is older than every release in the cache (oldest %s); its "
+                      "release facts are unknown" % (version, tags[0]))
     t = below[-1]
     if vt(t) == want[:len(vt(t))]:
         return t, None
-    if line(t) != line(version):
-        return t, "release %s not in the version table; nearest older release %s" % (version, t)
-    return t, "release %s not in the version table; using %s from the same line" % (version, t)
+    where = "same release line" if line(t) == line(version) else "earlier release line"
+    return t, ("release %s is not in the cache; using the nearest earlier release %s (%s)" %
+               (version, t, where))
 
 
 def gucs(tag):
     return dict(_load()["tags"].get(tag, {}).get("gucs", {}))
+
+
+# A deployment tool whose overrides the extractor could not check on this release (GitHub runs
+# search a fixed list of files). Every setting is then unknown for that tool.
+UNVERIFIED = "unverified"
 
 
 def profiles(tag):
@@ -77,6 +89,9 @@ def profiles(tag):
     base = gucs(tag)
     out = {"compiled default (manual install, upgraded YBA universe)": dict(base)}
     for tool, sets in sorted((_load()["tags"].get(tag, {}).get("profiles") or {}).items()):
+        if sets == UNVERIFIED:
+            out[tool] = {k: UNVERIFIED for k in base}
+            continue
         cur = dict(base)
         for k, v in sets.items():
             if isinstance(v, list):
@@ -92,6 +107,9 @@ def setting(tag, name):
         return None, "release unknown", {}
     per = {k: v.get(name) for k, v in profiles(tag).items()}
     vals = set(per.values())
+    if UNVERIFIED in vals:
+        return None, "unknown on %s: %s not verified" % (
+            tag, ", ".join(sorted(k for k, v in per.items() if v == UNVERIFIED))), per
     if vals == {None}:
         return None, "absent on %s" % tag, per
     if len(vals) == 1:
@@ -115,7 +133,7 @@ def pinned(tag, rule):
 
 def drift(tag_a, tag_b, names=None, rules=None):
     """Differences between two releases: settings and rule pinning."""
-    out = {"settings": {}, "rules": []}
+    out = {"settings": {}, "rules": [], "known": bool(tag_a and tag_b)}
     if not tag_a or not tag_b:
         return out
     pa, pb = profiles(tag_a), profiles(tag_b)
@@ -150,6 +168,11 @@ def _obs():
 def observations(rule):
     """Oracle observations recorded for a rule: [{release, mode, observation}]."""
     return list(_obs().get("rules", {}).get(rule, []))
+
+
+def has_observations():
+    """True when a local oracle cache exists (evals/yb-model/oracle.py writes it)."""
+    return bool(_obs().get("runs"))
 
 
 def oracle_coverage(release):

@@ -82,9 +82,11 @@ def _sh(cmd, inp=None, timeout=600):
 
 
 def find_image(version, image=None):
-    """(image, exact). Exact release first; otherwise the nearest image of the same release
-    line (major.minor), whose differences reconcile() then accounts for. Never across lines
-    unless the caller names the image."""
+    """(image, exact). Exact release first; otherwise the newest image of the same release
+    line (major.minor) that is older than the customer's release, whose differences
+    reconcile() then accounts for. Never a newer image (a newer planner may already fix what
+    the customer's release still does) and never across lines unless the caller names the
+    image."""
     from . import versions
     if image:
         tag = image.split(":")[-1].split("-")[0]
@@ -105,6 +107,7 @@ def find_image(version, image=None):
         below = [t for t in same if versions.vt(t.split(":")[1]) <= want]
         if below:
             return below[-1], False
+        return None, False
         return same[0], False
     return None, False
 
@@ -158,17 +161,27 @@ def build_inject_sql(bundle, sch):
     return "\n".join(lines) + "\n", rel
 
 
-def settings_sql(bundle, mode, tag=None, assumed=None):
+def settings_sql(bundle, mode, tag=None, assumed=None, boot=None):
     """Session settings for replay: the customer's pg_settings; for planner settings the
     bundle lacks, the customer's release default (the compiled default when deployment tools
-    disagree, recorded in `assumed`). The container's own launcher defaults never apply."""
+    disagree, recorded in `assumed`). Without release facts for the customer's release, the
+    replay image's own compiled defaults (`boot`, from pg_settings.boot_val) are set, also
+    recorded in `assumed`. The container launcher's defaults never apply."""
     from . import versions
     out = []
     gucs = dict((k, v) for k, v in bundle.settings.items() if k in PLANNER_GUCS)
     for name in ("yb_enable_cbo", "yb_enable_base_scans_cost_model",
                  "yb_enable_optimizer_statistics", "yb_enable_bitmapscan",
                  "yb_max_merge_scan_streams", "yb_use_hash_splitting_by_default"):
-        if name in gucs or tag is None:
+        if name in gucs:
+            continue
+        if tag is None:
+            v = (boot or {}).get(name)
+            if v is not None:
+                gucs[name] = v
+                if assumed is not None:
+                    assumed[name] = "%s (compiled default of the replay image; no release " \
+                                    "facts for %s)" % (v, bundle.version or "the release")
             continue
         v, src, per = versions.setting(tag, name)
         if v is None and per:
@@ -178,6 +191,15 @@ def settings_sql(bundle, mode, tag=None, assumed=None):
                     v, "; ".join("%s=%s" % (k, x) for k, x in sorted(per.items())))
         if v is not None:
             gucs[name] = v
+    # yb_enable_cbo sets the two older cost-model flags itself. When it is known, a default
+    # for either flag (applied in name order, after yb_enable_cbo for one of them) would undo
+    # part of it, so they are only set when the bundle itself gives them.
+    if "yb_enable_cbo" in gucs:
+        for legacy in ("yb_enable_base_scans_cost_model", "yb_enable_optimizer_statistics"):
+            if legacy not in bundle.settings:
+                gucs.pop(legacy, None)
+                if assumed is not None:
+                    assumed.pop(legacy, None)
     if mode == "on":
         gucs.update({"yb_enable_cbo": "on", "yb_enable_base_scans_cost_model": "on",
                      "yb_enable_optimizer_statistics": "on"})
@@ -221,8 +243,9 @@ class Container:
 
     def __enter__(self):
         _sh(["docker", "rm", "-f", self.name])
-        r = _sh(["docker", "run", "-d", "--name", self.name, self.image, "bin/yugabyted",
-                 "start", "--background=false", "--ui=false"])
+        # --pull=never: an image is only ever downloaded after the user agreed to it.
+        r = _sh(["docker", "run", "-d", "--pull=never", "--name", self.name, self.image,
+                 "bin/yugabyted", "start", "--background=false", "--ui=false"])
         if r.returncode != 0:
             raise RuntimeError("docker run failed: " + r.stderr.strip())
         for _ in range(100):
@@ -272,10 +295,12 @@ def run(bundle, image=None, mode="customer", keep=False, max_patterns=200, probe
     work = tempfile.mkdtemp(prefix="ybm-replay-")
     import json as _json
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    rule_ids = list(_json.load(open(os.path.join(here, "..", "rules", "rules.json")))["rules"])
+    with open(os.path.join(here, "..", "rules", "rules.json"), encoding="utf-8") as fh:
+        rule_ids = list(_json.load(fh)["rules"])
     result = {"image": img, "mode": mode, "patterns": [], "errors": [],
               "version_match": {"customer": bundle.version, "customer_release": cust_tag,
                                 "image_release": img_tag, "exact": exact,
+                                "drift_known": bool(cust_tag and img_tag),
                                 "drift": versions.drift(cust_tag, img_tag, rules=rule_ids)},
               "assumed_settings": {}}
     try:
@@ -299,7 +324,16 @@ def run(bundle, image=None, mode="customer", keep=False, max_patterns=200, probe
             result["inject_errors"] = {"count": n, "first": errs,
                                        "notices": [l.strip() for l in out.splitlines()
                                                    if "ybm:" in l][:50]}
-            set_sql, gucs = settings_sql(bundle, mode, cust_tag, result["assumed_settings"])
+            boot = {}
+            if cust_tag is None:
+                q = c.sql("SELECT name || '=' || boot_val FROM pg_settings WHERE name IN (%s);"
+                          % ", ".join(_lit(n) for n in PLANNER_GUCS), flags=("-tA",))
+                for line in q.stdout.splitlines():
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        boot[k.strip()] = v.strip()
+            set_sql, gucs = settings_sql(bundle, mode, cust_tag, result["assumed_settings"],
+                                         boot)
             result["settings"] = gucs
             remote_out = "/tmp/ybm_plans"
             pq = os.path.join(work, "patterns.sql")
@@ -323,7 +357,8 @@ def run(bundle, image=None, mode="customer", keep=False, max_patterns=200, probe
                          "error": perr.get(p["id"])}
                 fp = os.path.join(local_plans, "%s.json" % p["id"])
                 if os.path.isfile(fp):
-                    txt = open(fp).read().strip()
+                    with open(fp, encoding="utf-8") as fh:
+                        txt = fh.read().strip()
                     if txt:
                         try:
                             entry["plan"] = json.loads(txt)

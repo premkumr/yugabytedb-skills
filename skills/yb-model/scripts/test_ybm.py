@@ -14,7 +14,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from ybm import analyze, inputs, schema, sqlshape  # noqa: E402
+from ybm import analyze, inputs, report, schema, sqlshape  # noqa: E402
 
 FIXTURE = os.path.join(HERE, "..", "..", "..", "evals", "yb-model", "fixtures", "ecommerce",
                        "bundle")
@@ -286,7 +286,13 @@ class Versions(unittest.TestCase):
         self.assertEqual(v.resolve("9.1.2.0"), ("9.1.2.0", None))
         tag, note = v.resolve("9.1.3.1")
         self.assertEqual(tag, "9.1.2.0")
-        self.assertIn("same line", note)
+        self.assertIn("nearest earlier release 9.1.2.0", note)
+        # Another line's earlier release stands in; a newer release never does.
+        self.assertEqual(v.resolve("9.3.0.0")[0], "9.2.0.0")
+        self.assertEqual(v.resolve("9.1.1.5")[0], "9.1.0.0")
+        tag, note = v.resolve("9.0.5.0")
+        self.assertIsNone(tag)
+        self.assertIn("older than every release", note)
         self.assertFalse(v.available("9.1.0.0", "yb_max_merge_scan_streams"))
         self.assertTrue(v.available("9.1.2.0", "yb_max_merge_scan_streams"))
         self.assertIs(v.pinned("9.1.0.0", "CAP001"), False)
@@ -301,6 +307,34 @@ class Versions(unittest.TestCase):
         val, _, per = self.v.setting("9.2.0.0", "yb_use_hash_splitting_by_default")
         self.assertIsNone(val)
         self.assertEqual(sorted(set(per.values())), ["off", "on"])
+
+    def test_unverified_tool_profile_makes_a_setting_conditional(self):
+        self.v._DATA["tags"]["9.1.2.0"]["profiles"]["YBA new universe"] = self.v.UNVERIFIED
+        val, src, per = self.v.setting("9.1.2.0", "yb_use_hash_splitting_by_default")
+        self.assertIsNone(val)
+        self.assertIn("not verified", src)
+
+    def test_extractor_merges_source_paths_and_marks_unverified(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "evd", os.path.join(HERE, "extract-version-data.py"))
+        evd = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(evd)
+        merged = evd.merge_paths({"a": ["x"], "b": ["y"]}, {"a": {"z"}})
+        self.assertEqual(merged, {"a": ["x", "z"], "b": ["y"]})
+
+        class Src:
+            complete = False
+
+            def show(self, tag, path):
+                return ""
+
+            def grep(self, tag, regex, pathspec, context=0):
+                return []
+        self.assertEqual(evd.profiles(Src(), "v9.1.0.0", {}),
+                         {"YBA new universe": "unverified"})
+        Src.complete = True  # a git run searches everything: no hit means no override
+        self.assertEqual(evd.profiles(Src(), "v9.1.0.0", {}), {})
 
     def test_profiles_are_discovered_from_source(self):
         import importlib.util
@@ -327,7 +361,8 @@ class Versions(unittest.TestCase):
 
     def test_no_release_numbers_in_rules(self):
         here = os.path.dirname(os.path.abspath(__file__))
-        txt = open(os.path.join(here, "..", "rules", "rules.json")).read()
+        with open(os.path.join(here, "..", "rules", "rules.json"), encoding="utf-8") as fh:
+            txt = fh.read()
         self.assertNotRegex(txt, r"\b20\d\d\.\d+\.\d+")
         self.assertNotIn('"since"', txt)
 
@@ -347,7 +382,8 @@ class Fixture(unittest.TestCase):
 
     def test_answer_key_recall(self):
         res = json.loads(self.run_cli())
-        key = json.load(open(os.path.join(FIXTURE, "..", "answer-key.json")))
+        with open(os.path.join(FIXTURE, "..", "answer-key.json"), encoding="utf-8") as fh:
+            key = json.load(fh)
         got = {(f["rule"], f["object"]) for f in res["findings"]}
         missing = []
         for item in key["defects"]:
@@ -562,6 +598,131 @@ class IndexRuleEdges(unittest.TestCase):
         self.assertTrue(others)
         self.assertTrue(all(f["ddl"] is None for f in others))
         self.assertNotIn("SAF002", {f["rule"] for f in res["findings"]})
+
+
+class ReplayAuthority(unittest.TestCase):
+    """What a replayed plan may and may not do to a static finding."""
+
+    DDL = ("CREATE TABLE r (id bigint NOT NULL, k bigint, v text, PRIMARY KEY ((id) HASH));\n"
+           "CREATE INDEX r_v ON r ((v) HASH);\n")
+    Q = "SELECT id FROM r WHERE k = $1"   # nothing leads with k: CAP002, predicts a scan
+    INDEX_PLAN = [{"Plan": {"Node Type": "Index Scan", "Relation Name": "r",
+                            "Index Name": "r_v", "Alias": "r"}}]
+
+    def review(self, **vm):
+        d = Preflight.make(self, {"schema.sql": self.DDL, "queries.sql": self.Q + ";\n"})
+        b = inputs.load(d)
+        plans = {"version": "9.9.9.9-b1", "mode": "customer", "reltuples": {"r": 1e7},
+                 "patterns": [{"id": "P1", "query": self.Q, "plan": self.INDEX_PLAN}],
+                 "assumed_settings": vm.pop("assumed", {}),
+                 "version_match": dict({"customer": "9.9.9.9", "exact": True,
+                                        "drift_known": True, "drift": {"rules": []}}, **vm)}
+        return analyze.run(b, plans=plans)
+
+    def test_refutation_removes_when_settings_are_known(self):
+        res = self.review()
+        self.assertNotIn("CAP002", {f["rule"] for f in res["findings"]})
+        self.assertEqual(res["reconciliation"][0]["finding"], "CAP002")
+
+    def test_refutation_under_assumed_settings_disputes(self):
+        res = self.review(assumed={"yb_enable_cbo": "legacy_mode (compiled default)"})
+        cap = [f for f in res["findings"] if f["rule"] == "CAP002"]
+        self.assertEqual(len(cap), 1)
+        self.assertEqual(cap[0]["section"], "disputed")
+        self.assertIn("yb_enable_cbo", cap[0]["disputed"])
+        md = report.render(res)
+        self.assertIn("## Disputed by replay (planner settings assumed)", md)
+        findings = md.split("## Findings")[1].split("## Disputed")[0]
+        self.assertNotIn("CAP002", findings)
+
+    def test_unknown_drift_on_another_image_confirms_and_refutes_nothing(self):
+        res = self.review(exact=False, drift_known=False, image_release=None)
+        cap = [f for f in res["findings"] if f["rule"] == "CAP002"]
+        self.assertEqual(len(cap), 1)
+        self.assertIn("differences between the two releases are unknown", cap[0]["replay"])
+        self.assertNotEqual(cap[0]["section"], "disputed")
+
+
+class WorkloadShares(unittest.TestCase):
+    def test_shares_are_of_all_statement_time_and_dropped_rows_are_listed(self):
+        ddl = "CREATE TABLE w (id bigint NOT NULL, PRIMARY KEY ((id) HASH));\n"
+        pss = ("queryid,calls,total_exec_time,mean_exec_time,rows,query\n"
+               "1,100,600,6,100,SELECT * FROM w WHERE id = $1\n"
+               "2,100,300,3,0,COMMIT\n"
+               "3,10,100,10,10,SELECT * FROM other_schema_table WHERE x = $1\n")
+        d = Preflight.make(self, {"schema.sql": ddl, "ybm_pss.csv": pss})
+        res = analyze.run(inputs.load(d))
+        self.assertEqual(res["patterns"][0]["time_share"], 0.6)
+        item = [o for o in res["open_items"] if "not analysed as access patterns" in o]
+        self.assertEqual(len(item), 1)
+        self.assertIn("2 of 3", item[0])
+
+
+class LintRedundancy(unittest.TestCase):
+    def lint(self, ddl):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("ybl", os.path.join(HERE, "yb-lint.py"))
+        ybl = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ybl)
+        return {(f.rule, f.message.split("'")[1]) for f in ybl.lint(ddl)
+                if f.rule in ("YB051", "YB052")}
+
+    T = "CREATE TABLE t (id bigint, a int, b int, c int, PRIMARY KEY ((id) HASH));\n"
+
+    def test_real_prefix_and_duplicate_are_flagged(self):
+        got = self.lint(self.T + "CREATE INDEX i1 ON t (a HASH);\n"
+                                 "CREATE INDEX i2 ON t (a HASH, b ASC);\n"
+                                 "CREATE INDEX i3 ON t (b ASC, c ASC);\n"
+                                 "CREATE INDEX i4 ON t (b ASC, c ASC);\n")
+        self.assertIn(("YB051", "i1"), got)
+        self.assertEqual(len([g for g in got if g[0] == "YB052"]), 1)
+
+    def test_layout_uniqueness_and_include_are_respected(self):
+        got = self.lint(self.T + "CREATE INDEX h ON t (a HASH);\n"
+                                 "CREATE INDEX r ON t (a ASC, b ASC);\n"
+                                 "CREATE UNIQUE INDEX u ON t (b HASH);\n"
+                                 "CREATE INDEX ub ON t (b HASH, c ASC);\n"
+                                 "CREATE INDEX ci ON t (c ASC) INCLUDE (a);\n"
+                                 "CREATE INDEX cb ON t (c ASC, b ASC);\n"
+                                 "CREATE INDEX g ON t ((a, b) HASH);\n")
+        self.assertEqual(got, set())
+
+
+class TabletCounts(unittest.TestCase):
+    DDL = ("CREATE TABLE big (id bigint NOT NULL, PRIMARY KEY ((id) HASH)) "
+           "SPLIT INTO 1 TABLETS;\n")
+
+    def spl(self, tablets_csv):
+        d = Preflight.make(self, {"schema.sql": self.DDL, "ybm_tablets.csv": tablets_csv,
+                                  "ybm_reltuples.csv": "relname,relkind,reltuples\nbig,r,5e7\n"})
+        return [f for f in analyze.run(inputs.load(d))["findings"] if f["rule"] == "SPL001"]
+
+    def test_cluster_wide_counts_confirm(self):
+        f = self.spl("schemaname,relname,num_tablets\npublic,big,1\n")
+        self.assertEqual(f[0]["confidence"], "confirmed")
+
+    def test_one_node_listing_stays_probable(self):
+        f = self.spl("table_name,tablets\nbig,1\n")
+        self.assertTrue(f[0]["confidence"].startswith("probable"))
+        self.assertIn("one node", f[0]["fact"])
+
+
+class ReplaySettings(unittest.TestCase):
+    def test_settings_without_release_facts_use_image_defaults_and_keep_cbo(self):
+        from ybm import replay
+        d = Preflight.make(self, {"schema.sql": "CREATE TABLE t (id int PRIMARY KEY);\n",
+                                  "ybm_settings.csv": "name,setting\nyb_enable_cbo,on\n"})
+        b = inputs.load(d)
+        assumed = {}
+        boot = {"yb_enable_cbo": "legacy_mode", "yb_enable_bitmapscan": "off",
+                "yb_enable_base_scans_cost_model": "off",
+                "yb_enable_optimizer_statistics": "off"}
+        _, gucs = replay.settings_sql(b, "customer", None, assumed, boot)
+        self.assertEqual(gucs["yb_enable_cbo"], "on")          # the bundle wins
+        self.assertNotIn("yb_enable_optimizer_statistics", gucs)  # derived from cbo
+        self.assertEqual(gucs["yb_enable_bitmapscan"], "off")
+        self.assertEqual(sorted(assumed), ["yb_enable_bitmapscan"])
+        self.assertIn("compiled default of the replay image", assumed["yb_enable_bitmapscan"])
 
 
 if __name__ == "__main__":

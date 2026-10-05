@@ -160,6 +160,12 @@ def apply(col, plans, recon):
         if r["verdict"] == "holds":
             f.verified = "holds on %s: %s" % (where, txt)
         elif r["verdict"] == "refuted":
+            if plans.get("assumed_settings"):
+                # Under assumed planner settings a refutation disputes, never removes.
+                f.disputed = ("the rule's probe on %s, run under assumed planner settings "
+                              "(%s), did not hold: %s" % (
+                                  where, ", ".join(sorted(plans["assumed_settings"])), txt))
+                continue
             recon.append({"finding": f.rule, "object": f.obj, "patterns": f.patterns,
                           "outcome": "rule refuted on %s by its probe" % where,
                           "plan": "%s failed: %s" % (r["detail"], txt)})

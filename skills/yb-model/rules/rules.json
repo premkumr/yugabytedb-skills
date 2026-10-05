@@ -250,7 +250,7 @@
       "test": []
     },
     "IDX001": {
-      "kind": "capability",
+      "kind": "workload",
       "severity": "low",
       "title": "Index serves no ranked access pattern",
       "mechanism": "No ranked pattern can use this index as its access path, so it is pure write cost for the workload captured.",
@@ -310,7 +310,12 @@
       "title": "Replayed plan: Sort feeding a Limit",
       "mechanism": "The planner sorts every qualifying row before returning the first few.",
       "fix": "See CAP010 / CAP011 for this pattern.",
-      "test": []
+      "test": [
+        {
+          "file": "yb.orig.join_batching.out",
+          "anchor": "EXPLAIN (COSTS OFF) SELECT q1nulls.a, q1nulls.b FROM q1nulls, q2 WHERE q1nulls.b = q2.c2 ORDER BY q1nulls.a ASC LIMIT 10;"
+        }
+      ]
     },
     "PLN003": {
       "kind": "plan",
@@ -318,7 +323,12 @@
       "title": "Replayed plan: Append over unpruned partitions",
       "mechanism": "The plan visits several partitions for one execution.",
       "fix": "See CAP030 for this pattern.",
-      "test": []
+      "test": [
+        {
+          "file": "yb.port.partition_prune.out",
+          "anchor": "explain (costs off) select * from lp where a <> 'a' and a <> 'd';"
+        }
+      ]
     },
     "PLN004": {
       "kind": "plan",
@@ -326,7 +336,12 @@
       "title": "Replayed plan: Index Scan on a secondary index (base-table fetch)",
       "mechanism": "The chosen secondary index is not covering, so rows are fetched from the base table.",
       "fix": "See CAP020 for this pattern.",
-      "test": []
+      "test": [
+        {
+          "file": "yb.orig.index_scan.out",
+          "anchor": "-- test index only scan with non-target column refs in qual (github issue #9176)"
+        }
+      ]
     },
     "SPL001": {
       "kind": "stats",
@@ -494,7 +509,12 @@
       "title": "Ordered index walk with a filter until LIMIT",
       "mechanism": "No index can seek on the filter, but a range-led index matches ORDER BY, so the planner reads it in order and filters each row until LIMIT rows match. When matches are rare, that is most of the index.",
       "fix": "Index the filter columns first and the ORDER BY columns after them.",
-      "test": [],
+      "test": [
+        {
+          "file": "yb.orig.dml_systable_scan.out",
+          "anchor": "EXPLAIN (COSTS OFF) SELECT classid, objid, objsubid, refclassid, refobjid, deptype FROM pg_depend"
+        }
+      ],
       "probe": {
         "setup": [
           "DROP TABLE IF EXISTS ybm_p12;",

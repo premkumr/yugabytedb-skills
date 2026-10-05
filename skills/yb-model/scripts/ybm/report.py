@@ -29,7 +29,8 @@ def _conf(f):
 
 def headline(res):
     """The review's opening sentences, written by the engine so every model says the same."""
-    fs = [f for f in res["findings"] if f.get("section") != "hygiene"] or res["findings"]
+    fs = [f for f in res["findings"] if f.get("section") not in ("hygiene", "disputed")] or \
+        [f for f in res["findings"] if f.get("section") != "disputed"]
     if not fs:
         return "**No findings.** See open items for what could not be checked."
     share = {p["id"]: p.get("time_share") for p in res["patterns"]}
@@ -161,8 +162,9 @@ def render(res):
     w("## Findings")
     w("")
     allf = res["findings"]
-    fs = [f for f in allf if f.get("section") != "hygiene"]
+    fs = [f for f in allf if f.get("section") not in ("hygiene", "disputed")]
     hyg = [f for f in allf if f.get("section") == "hygiene"]
+    disp = [f for f in allf if f.get("section") == "disputed"]
     if not fs:
         w("No findings.")
     else:
@@ -204,6 +206,9 @@ def render(res):
             if f.get("test_refs"):
                 w("- **Pinned by:** %s" % "; ".join(
                     "`%s` (\"%s\")" % (t["file"], t["anchor"]) for t in f["test_refs"]))
+            elif f.get("basis") == "computed from the bundle":
+                w("- **Basis:** computed from this bundle's statistics and workload; no planner "
+                  "behaviour is involved, so no regress test applies.")
             w("")
         infos = [f for f in fs if f["severity"] == "info" and f["rule"].startswith("LINT-")]
         if infos:
@@ -211,6 +216,24 @@ def render(res):
                 "%s %s" % (f["id"], _cell(f["fact"], 90)) for f in infos)))
             w("")
 
+    w("## Disputed by replay (planner settings assumed)")
+    w("")
+    if not disp:
+        w("None.")
+    else:
+        w("The bundle had no pg_settings, so replay ran under assumed planner settings, and "
+          "under them the planner disagreed with these findings. They are kept, because the "
+          "customer's real settings may differ, but they are not part of the recommended DDL "
+          "or action items. Collect `ybm_settings.csv` (collect.sql) and review again to settle "
+          "them.")
+        w("")
+        w("| ID | Severity | Rule | Object | Finding | Why disputed | Fix if it holds |")
+        w("|---|---|---|---|---|---|---|")
+        for f in disp:
+            w("| %s | %s | %s | %s | %s | %s | %s |" % (
+                f["id"], f["severity"], f["rule"], _cell(f["object"], 60),
+                _cell(f["fact"], 200), _cell(f["disputed"], 220), _cell(f["fix"], 160)))
+    w("")
     w("## Workload hygiene (confirm with the application team)")
     w("")
     if not hyg:
@@ -287,7 +310,13 @@ def render(res):
               rp.get("version"), rp.get("mode"), len(rp.get("planned", [])),
               len(rp.get("failed", [])), rp.get("ddl_errors", "n/a")))
         vm = rp.get("version_match") or {}
-        if vm and not vm.get("exact", True):
+        if vm and not vm.get("exact", True) and rp.get("drift_unknown"):
+            w("")
+            w("Replay ran on %s, not the customer's %s, and without release facts for both "
+              "the differences between the two releases could not be computed. Replay "
+              "therefore confirmed and refuted nothing; access-path findings stay as the "
+              "static review left them." % (rp.get("version"), vm.get("customer")))
+        elif vm and not vm.get("exact", True):
             d = vm.get("drift") or {}
             w("")
             w("Replay ran on %s, the nearest image to the customer's %s. Differences between "
@@ -327,12 +356,14 @@ def render(res):
             w("Self-check (apply all recommended DDL, review again): DID NOT CONVERGE. %s" %
               "; ".join(fp["problems"]))
         else:
-            w("Self-check: applying every recommended DDL and reviewing again resolves the %d "
-              "findings that carry DDL, introduces nothing new, and a second round changes "
-              "nothing." % fp.get("fixed_with_ddl", 0))
+            w("Self-check: applying every recommended DDL to a copy of the schema and reviewing "
+              "it again statically resolves the %d schema findings that carry DDL and adds no "
+              "new schema finding at medium or above; a second round adds none either. "
+              "Workload, plan and safety findings describe the workload as measured and are not "
+              "re-checked." % fp.get("fixed_with_ddl", 0))
     w("")
     w("Not verified by this review: actual latencies and RPC counts on the live cluster "
-      "(`EXPLAIN (ANALYZE, DIST)`), tablet counts from `yb_local_tablets` if not supplied, "
+      "(`EXPLAIN (ANALYZE, DIST)`), tablet counts if `ybm_tablets.csv` was not supplied, "
       "client retry behaviour, CDC and retention.")
     w("")
 
@@ -345,6 +376,10 @@ def render(res):
             w("%d. %s (%s): %s" % (n, f["id"], f["severity"], _cell(f["fix"] or f["title"], 300)))
     if n == 0:
         w("None at medium severity or above.")
+    if disp:
+        w("")
+        w("Before acting on the %d disputed finding(s), collect pg_settings and review again "
+          "(see Disputed by replay)." % len(disp))
     hy = [f for f in hyg if f["severity"] in ("critical", "high", "medium")]
     if hy:
         w("")

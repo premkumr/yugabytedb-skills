@@ -513,8 +513,13 @@ def check_index(st, findings, index_registry, table_cols=None):
             )
         )
 
+    inc = re.search(r"\bINCLUDE\s*\(([^)]*)\)", tail, re.I)
+    include = {c.strip().strip('"').lower() for c in inc.group(1).split(",")} if inc else set()
+    # Key layout as YugabyteDB resolves it: an unannotated first column is HASH (the default
+    # outside colocation), later unannotated columns ASC.
+    layout = tuple((c, m or ("HASH" if i == 0 else "ASC")) for i, (c, m) in enumerate(cols))
     index_registry.setdefault(tname, []).append(
-        (iname, [c for c, _ in cols], st.line, bool(re.search(r"\bWHERE\b", tail, re.I)))
+        (iname, layout, st.line, bool(re.search(r"\bWHERE\b", tail, re.I)), is_unique, include)
     )
 
 
@@ -552,42 +557,57 @@ def cross_checks(index_registry, findings, max_indexes):
                     f"Justify each index against a named access pattern; target <= {max_indexes}.",
                 )
             )
-        seen = {}
-        for a_name, a_cols, a_line, _ in non_partial:
-            sig = tuple(a_cols)
-            if not sig:
-                continue
-            if sig in seen and seen[sig] != a_name:
-                findings.append(
-                    Finding(
-                        "YB052",
-                        "warn",
-                        a_line,
-                        f"{table}: index '{a_name}' has the same key columns as "
-                        f"'{seen[sig]}' ({', '.join(a_cols)}).",
-                        "One of these is dead weight on every write. Confirm idx_scan = 0, "
-                        f"then DROP INDEX CONCURRENTLY {a_name}.",
-                    )
-                )
-            else:
-                seen.setdefault(sig, a_name)
-
-        for a_name, a_cols, a_line, _ in non_partial:
-            for b_name, b_cols, _, _ in non_partial:
-                if a_name == b_name or not a_cols or len(a_cols) >= len(b_cols):
+        for a in non_partial:
+            for b in non_partial:
+                if a[0] == b[0] or not covers(b, a):
                     continue
-                if b_cols[: len(a_cols)] == a_cols:
+                a_name, a_key, a_line = a[0], a[1], a[2]
+                cols = ", ".join("%s %s" % kv for kv in a_key)
+                if len(a_key) == len(b[1]):
+                    if b[0] < a[0] and covers(a, b):
+                        continue  # identical pair: report it once
+                    findings.append(
+                        Finding(
+                            "YB052",
+                            "warn",
+                            a_line,
+                            f"{table}: index '{a_name}' ({cols}) duplicates '{b[0]}': same key "
+                            "columns, layout and sort order, not unique, and its INCLUDE "
+                            "columns are covered.",
+                            "Confirm idx_scan = 0 and that no hint or constraint names it, "
+                            f"then DROP INDEX CONCURRENTLY {a_name}.",
+                        )
+                    )
+                else:
                     findings.append(
                         Finding(
                             "YB051",
                             "warn",
                             a_line,
-                            f"{table}: index '{a_name}' ({', '.join(a_cols)}) is a prefix of "
-                            f"'{b_name}' and is probably redundant.",
-                            "Confirm idx_scan = 0 in pg_stat_user_indexes, then "
-                            f"DROP INDEX CONCURRENTLY {a_name}.",
+                            f"{table}: index '{a_name}' ({cols}) is a prefix of '{b[0]}' with "
+                            "the same hash group and sort order, is not unique, and its "
+                            "INCLUDE columns are covered, so it is probably redundant.",
+                            "Confirm idx_scan = 0 and that no hint or constraint names it, "
+                            f"then DROP INDEX CONCURRENTLY {a_name}.",
                         )
                     )
+
+
+def covers(b, a):
+    """True when index b can serve everything index a serves, so a is redundant: neither is
+    partial (the caller filters), a is not unique (it enforces a constraint b does not, unless
+    both are unique on the same key), a's key with its HASH / ASC / DESC layout is a prefix of
+    b's, both have the same hash group, and a's INCLUDE columns are in b's key or INCLUDE."""
+    a_key, b_key = a[1], b[1]
+    if len(a_key) > len(b_key) or b_key[: len(a_key)] != a_key:
+        return False
+    if a[4] and not (b[4] and len(a_key) == len(b_key)):
+        return False
+    hash_a = [c for c, m in a_key if m == "HASH"]
+    hash_b = [c for c, m in b_key if m == "HASH"]
+    if hash_a != hash_b:
+        return False
+    return a[5] <= ({c for c, _ in b_key} | b[5])
 
 
 def lint(sql, max_indexes=6):

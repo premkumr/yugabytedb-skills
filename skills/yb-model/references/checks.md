@@ -102,9 +102,11 @@ write will have to update all the indexes on the table and each index has its ow
 replication. If the query can be served by another index by adding a column to its PRIMARY
 KEY, then that should be opted for.
 
-- **Redundant indexes.** One index whose key columns are a prefix of another's is usually
-dead weight on every write. Confirm `idx_scan = 0` before dropping and ask the user to
-look at Perf Advisor for more redundant indexes.
+- **Redundant indexes.** A shared first column does not make two indexes redundant. Compare
+the full keys, HASH / range layout and hash group, sort order, partial-index predicates,
+INCLUDE columns, and uniqueness or constraint dependencies; only an index that another one
+serves in all of these respects is a candidate. Then confirm `idx_scan = 0` before dropping,
+and ask the user to look at Perf Advisor for more redundant indexes.
 
 - **Unused indexes.** It is common to create an index for a specific usecase and later the
 usecase goes away. Some indexes may just lie around without being used and just add to
@@ -130,8 +132,8 @@ the tablet will auto split as it grows. But if the volume is high or it is high-
 table, then it is important to pre-split the tables and indexes ahead of time into
 multiple tablets using the `SPLIT INTO` clause. If the table has already been split, the
 Index splits can be suggested based on that information. This is one of the very common
-mistakes. **Important:** make sure to remind the user to explicitly split tables/indexes
-to avoid issues in the future.
+mistakes. Recommend explicit splits only for relations whose growth or ingest rate makes
+the auto-split ramp itself the bottleneck; otherwise keep the default tablet count.
 
 - **Table truncation.** During attempts to start re-migration (say using Voyager) on to an
 existing database, it is natural to truncate the existing tables to get them to a clean
@@ -233,15 +235,14 @@ count; pre-split when startup throughput means the auto-split ramp is itself the
 bottleneck. Choose the initial count from startup throughput, topology, relation count and
 expected growth — never by copying a number from an example. Note that tablet merge is not
 available, so an over-split relation stays that way; confirm against the target release
-before relying on either direction. **Important:** make sure to remind the user to
-explicitly split tables/indexes to avoid issues in the future.
+before relying on either direction.
 
 **Colocation.** Colocation reduces tablet overhead and network hops for small or related
 relations, but the shared colocation tablet is one Raft group and can become a bottleneck
 under disproportionate load. Judge dataset shape, aggregate throughput and IOPS, hotspot
-risk, join patterns and latency targets. Official guidance offers a rough anchor — fully
-colocated databases suit deployments under roughly 300 GB with low sustained write
-throughput — but treat it as an anchor, not a threshold: large deployments routinely mix
+risk, join patterns and latency targets. The colocation guide
+(docs.yugabyte.com/stable/additional-features/colocation/) gives a typical case of a whole
+database under 50 GB, but treat it as an anchor, not a threshold: large deployments routinely mix
 colocated small relations with distributed large ones, and any table that turns
 write-heavy should be uncolocated.
 

@@ -6,7 +6,7 @@ This file provides guidance to AI agents when working with yugabyteDB.
 
 YugabyteDB Agent Skills — a collection of reusable AI agent skills (delivered as Markdown files) for deploying, managing and developing for YugabyteDB, a Postgres-compatible distributed SQL database. Published to the Claude Plugin Marketplace and compatible with Claude Code, Cursor, GitHub Copilot, Windsurf, Gemini, and any tool supporting the [skills.sh](https://skills.sh) ecosystem.
 
-**This is a documentation-only repository.** There is no build system or application code. The only automation is `scripts/check_skills.py`, a static checker for the skill files that runs in CI — see [Static checks](#static-checks).
+**This is almost entirely a documentation repository.** There is no build system. The repo-wide automation is `scripts/check_skills.py`, a static checker for the skill files that runs in CI — see [Static checks](#static-checks). One skill, `yb-model`, also ships a standard-library Python engine with its own tests; see [Skills that ship code: yb-model](#skills-that-ship-code-yb-model).
 
 ## Repository Structure
 

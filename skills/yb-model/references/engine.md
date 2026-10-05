@@ -27,8 +27,13 @@ With `pg_stat_statements`, patterns are ranked by total execution time:
 
 - **HOT:** the patterns that cover the first 80% of total time (at most 25 of them), plus
   the 10 most-called patterns.
-- **WARM:** at least 1% of time or calls.
+- **WARM:** at least 0.1% of time or calls.
 - **COLD:** everything else.
+
+The ranking is among the statements the engine can analyse. Catalog and monitoring queries,
+session and utility statements (`SET`, `COMMIT`, ...) and statements on tables outside the
+schema are not analysed; an open item lists how many there are and their share of time, and
+every share the report quotes (pattern table, headline) is a share of *all* statement time.
 
 Without `pg_stat_statements`, patterns come from `queries.sql`, are marked UNRANKED, and
 severity is not traffic-weighted.
@@ -52,7 +57,10 @@ of the headline, and words their fixes for the application team.
 
 *Pinned by* names the regress output file and a fixed string in it. To read the test, open
 `src/postgres/src/test/regress/expected/<file>` in yugabyte-db at the customer's release tag
-and search for the string.
+and search for the string. Only rules that claim planner or execution behaviour (`CAP`,
+`PLN`) cite tests, and `scripts/check-rule-refs.py` fails if one does not. `STA`, `WRK`, `CFG`,
+`SPL` and `SAF` rules are arithmetic on the bundle; their findings say *Basis: computed from
+this bundle's statistics and workload*.
 
 ## 4. Replay
 
@@ -65,9 +73,15 @@ During reconciliation, each static access-path finding is checked against the re
 of its patterns:
 
 - **Matched:** the finding becomes `confirmed (replay)`.
-- **Contradicted:** the finding is removed and listed under *Findings removed because the
-  replayed plan contradicted them*. Read that list: it is where the static rules are
-  weakest.
+- **Contradicted, settings known:** the finding is removed and listed under *Findings
+  removed because the replayed plan contradicted them*. Read that list: it is where the
+  static rules are weakest.
+- **Contradicted, settings assumed:** when the bundle has no pg_settings, replay runs under
+  assumed planner settings (the release default, or the image's compiled default when no
+  release facts are cached; the report lists them). A contradiction then only *disputes* the
+  finding: it moves to the *Disputed by replay* section, out of the recommended DDL and action
+  items, and stays visible. A false positive is preferred to losing a real problem on a guess.
+  Probes follow the same rule.
 - **Planner chose a different path:** the finding keeps `probable` and shows the chosen path.
 
 Replay plans are estimates. Injected statistics do not reproduce cache state, network
@@ -84,7 +98,7 @@ in `rules.json`. A probe has setup SQL that generates a few thousand rows, liter
 rule is about) and `holds` checks over the measured counters.
 
 During replay, the engine runs the probes of the rules that fired, in the same container (the
-customer's release, or the nearest image in its line) under the same planner settings.
+customer's release, or the newest earlier image in its line) under the same planner settings.
 Verdicts: **holds** (the finding names the release and the counters), **refuted** (the
 finding is withdrawn and listed with the counters), **inconclusive** (the finding says
 unverified). Without replay, the finding says its mechanism is unverified on the release.
@@ -132,19 +146,31 @@ The engine resolves the customer's release to the newest table entry at or below
   `requires` one of them;
 - marks findings whose rule is not pinned by a test on that release;
 - says when the planner model has not been checked by the oracle on that release;
-- emits `RELEASE-DATA-MISSING` with the exact `update-versions --github` command when the
-  release is not in the table. The skill asks the user before running it (network).
+- emits `RELEASE-DATA-MISSING` with the `update-versions` commands when the release is not
+  cached (`--repo` reads a local checkout; `--github` needs the user's agreement).
 
-Replay picks the exact image, or else the nearest image of the same release line. It sets
-the customer's effective planner settings explicitly (the container's launcher defaults never
-apply), records the drift between the two releases, and does not let replay confirm a rule
-whose tested behaviour differs between them.
+When the customer's release is not cached, the nearest **earlier** cached release stands in,
+from any release line; a newer release never does, because it may already fix what the
+customer's release still does. A release older than everything cached has no stand-in.
+GitHub-built entries record a deployment tool whose overrides could not be checked as
+*unverified*, which makes the settings it might change conditional.
+
+Replay picks the exact image, or else the newest earlier image of the same release line
+(never a newer one). It sets the customer's effective planner settings explicitly, so the
+container launcher's defaults never apply: from the bundle, else the release default, else
+(no release facts) the image's own compiled defaults, recorded as assumed. It records the
+drift between the two releases and does not let replay confirm a rule whose tested behaviour
+differs between them; without release facts for both, the drift is unknown and a replay on a
+different image confirms and refutes nothing.
 
 ## 7. Self-checks
 
-- **Fixpoint** (`yb-model.py fixpoint`, also run by `review`): apply every recommended DDL,
-  review again; fixed findings must be gone, nothing new may appear, and a second round
-  must change nothing.
+- **Fixpoint** (`yb-model.py fixpoint`, also run by `review`): starting from the review as
+  reported (its final findings and DDL, after replay and probes; disputed findings excluded),
+  apply every recommended DDL to a copy of the schema and review it again statically. Each
+  schema finding that carried DDL must be gone and no new schema finding at medium or above
+  may appear; a second round must add none either. Workload, plan and safety findings
+  describe the workload as measured and are not re-checked.
 - **Planner oracle** (`evals/yb-model/oracle.py`, maintainer tool): generates hundreds of
   seeded schema and query cases, plans them on a real YugabyteDB with injected statistics,
   and compares the planner's choices with the engine's static model. Capability
@@ -182,8 +208,9 @@ flag, so `analyze`, `review` and the fixpoint self-check all see the same rule s
 
 - Measure latency or tablet sizes on the live cluster.
 - Judge client retry behaviour, CDC, retention, or erasure.
-- Parse every SQL construct. Unresolved columns and unparsed statements are listed as open
-  items; they are never silently dropped.
+- Parse every SQL construct. Unresolved columns are listed as open items, and statements
+  that are not analysed as access patterns are counted in one (by reason, with their share
+  of statement time).
 
 These go under Limitations, or into Reviewer notes with `references/checks.md` as the
 reference.

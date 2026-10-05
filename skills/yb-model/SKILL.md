@@ -1,22 +1,25 @@
 ---
 name: yb-model
-description: "Review/validate a YugabyteDB YSQL schema for distribution, sharding, indexing, partitioning, tablet-split and write-path defects, with a DDL linter and an independent second pass. Use whenever the user mentions YugabyteDB, YSQL, DocDB, tablets, hash or range sharding, hot shards, tablet skew, redundant or unused indexes, or Voyager, or pastes DDL, a pg_dump, pg_stats, pg_stat_statements or a tablet report and asks whether it looks right, even if they never say the word review. Also use when someone types yb-model."
+description: "Complete review of an existing YugabyteDB YSQL schema and data model: primary keys and sharding, indexes, partitions, tablet splits, data quality and how the workload uses them, judged against every piece of evidence available (the schema dump, pg_stats, pg_stat_statements, row counts, planner settings, index usage and tablet counts). Use when the user asks to review, validate or audit a YSQL schema or data model, or shares a schema dump or statistics bundle and asks whether it holds up. Triggers on schema review, data model review, ysql_dump, pg_stats, pg_stat_statements, collect.sql, hot shards, tablet skew, unused or redundant indexes, yb-model. For writing a new schema, application code or a migration plan, use the ysql skill instead."
 ---
 
 # YugabyteDB schema review
 
-Review is the only supported mode. If the user asks for a greenfield design or a full
-migration plan, say in one line that those tracks are not ready, then review whatever DDL
-they have and label the result a structural review.
+This skill reviews an existing schema, completely, from as much evidence as the user can
+give: the more of the bundle in step 1 exists, the more of the engine runs. It does not
+design new schemas, write application code or plan migrations; for those, use the `ysql`
+skill, whose Voyager reference covers migrations. If the user has only DDL, review it
+and the report labels the result a structural review.
 
 **Scope guard.** YugabyteDB YSQL only. Do not apply these rules to plain PostgreSQL work.
 
 ## How this skill works
 
 The findings come from a deterministic engine, `scripts/yb-model.py`. Its rules live in
-`rules/rules.json`, and each one cites the yugabyte-db regress test that pins the
-behaviour. The same inputs give the same findings, severities, ranking and DDL, whichever
-model runs the skill.
+`rules/rules.json`. A rule that claims planner or execution behaviour cites the yugabyte-db
+regress test that pins it; statistics, workload and configuration rules are arithmetic on the
+customer's own data, and their findings say "computed from the bundle". The same inputs give
+the same findings, severities, ranking and DDL, whichever model runs the skill.
 
 Your job is to collect the inputs, run the engine, write a short summary and say what was
 not verified. **Do not add, drop, re-rank, re-word or re-grade findings yourself.** If you
@@ -46,6 +49,13 @@ Copy this checklist and tick it off.
 ```
 
 ### 1. Gather
+
+A complete review needs the complete bundle, so ask for it before running anything. If the
+user can reach the cluster, give them the two capture commands in `references/intake.md` §1
+(`ysql_dump --include-yb-metadata` and `scripts/collect.sql`): together they write every file
+the engine reads, namely statistics, workload, row counts, planner settings, index usage,
+tablet counts and the release. Take whatever they can give; preflight (step 1b) names what is
+still missing.
 
 Make one directory (the *bundle*) and put the DDL in `schema.sql`. Copy every file the user
 gave you into it unchanged:
@@ -96,7 +106,7 @@ python3 <skill-dir>/scripts/yb-model.py review <bundle>
 
 Add no flags other than `--accept-missing` (step 1b). The engine runs replay by itself when Docker has a `yugabytedb/yugabyte`
 image for the bundle's version (from `ybm_meta.csv`), and prints why when it cannot. Replay
-does three things:
+does four things:
 
 1. Starts that version in a scratch container.
 2. Injects the customer's row counts and column statistics, the way the TAQO planner tests
@@ -131,17 +141,21 @@ If the engine cannot run on this surface, say so and review by hand with
    deployed, features that do not exist on this release, and the **Muted checks** table
    (which rules were muted or weakened by which missing input, and the candidates withheld).
 4. **Access patterns**: P1..Pn with weight, calls, time share, access path.
-5. **Findings**: schema findings, ranked, each with fact, mechanism, fix and the test that
-   pins it.
-6. **Workload hygiene (confirm with the application team)**: how the application uses the
+5. **Findings**: schema findings, ranked, each with fact, mechanism, fix and its basis (the
+   regress test that pins it, or "computed from the bundle").
+6. **Disputed by replay (planner settings assumed)**: findings that replay disagreed with
+   while running under assumed planner settings (the bundle had no pg_settings). They are
+   kept, because the customer's real settings may differ, but stay out of the recommended
+   DDL and action items. Say so plainly; collecting `ybm_settings.csv` settles them.
+7. **Workload hygiene (confirm with the application team)**: how the application uses the
    database (lookups that find nothing, UPDATEs that match nothing or rewrite every column,
    full-table counts, fan-out, planning time). Not schema defects; hand these to the app
    owners.
-7. **What is already sound.**
-8. **Recommended DDL**, after the safety pass.
-9. **Safety check of the recommendations.**
-10. **Validation and limitations**, including replay and the self-check.
-11. **Action items**, schema first, then the application team.
+8. **What is already sound.**
+9. **Recommended DDL**, after the safety pass.
+10. **Safety check of the recommendations.**
+11. **Validation and limitations**, including replay and the self-check.
+12. **Action items**, schema first, then the application team.
 
 ### Versions
 
@@ -156,16 +170,23 @@ an upgraded universe keeps `legacy_mode`). The engine reads these facts from a l
   items say so. Ask for `ybm_settings.csv` rather than guessing.
 - A fix that needs a feature the release lacks (for example merge scan streams) is replaced
   with one that works on that release.
-- A finding whose behaviour no regress test pins on the customer's release is marked "not
-  pinned by tests on <release>".
+- A finding whose rule cites a regress test that does not exist on the customer's release
+  is marked "not pinned by tests on <release>".
+- When the cache lacks the customer's release, the nearest *earlier* release stands in, never
+  a newer one (a newer release may already fix what the customer's still does); the open
+  items name it. Replay follows the same rule: the exact image, or else the newest earlier
+  image of the same release line.
 - Replay on an image that is not the customer's exact release lists the differences between
-  the two releases, and does not confirm rules whose tested behaviour differs.
+  the two releases, and does not confirm rules whose tested behaviour differs. Without
+  release facts for both, the differences are unknown and such a replay confirms or refutes
+  nothing.
 - If the open items contain `RELEASE-DATA-MISSING`, the cache has no entry for the customer's
   release (on a fresh install it is empty). If the user has a yugabyte-db checkout, run the
   `--repo` command quoted in that item with its path; it reads local files only. Otherwise
   **ask the user** whether you may fetch the release's source facts from GitHub, and run the
   `--github` command only if they agree. Then run the review again. If they decline, keep
-  the review and say which release facts are unknown or come from the nearest release.
+  the review and say which release facts are unknown or come from the nearest earlier
+  release.
 
 ### 3. Replay
 

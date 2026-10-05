@@ -27,8 +27,10 @@ key, setup SQL or workload.
    ysql_dump -h <host> -U <user> -d <db> --schema-only --include-yb-metadata > schema.sql
    ```
 
-2. Put the files in `fixtures/<name>/bundle/`. Strip anything confidential from
-   `ybm_pss.csv` query text first. Literals are already normalised to `$n`.
+2. Put the files in `fixtures-private/<name>/bundle/`. That folder is ignored by git: a
+   customer's schema, statistics and workload are never committed, and nothing derived from
+   them goes into a commit (see `AGENTS.md`). Only synthetic fixtures, such as `ecommerce`,
+   live in `fixtures/`.
 3. Write `answer-key.json` from what the case actually established: the ticket, the RCA,
    what the customer changed. List traps too: things a review should not claim.
 

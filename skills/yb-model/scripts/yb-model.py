@@ -191,7 +191,7 @@ def main():
         # Self-check: apply the engine's own DDL and confirm the review converges.
         from ybm import fixpoint
         try:
-            res["fixpoint"] = fixpoint.check(bundle)
+            res["fixpoint"] = fixpoint.check(bundle, final=res)
         except Exception as e:  # never hide a self-check failure
             res["fixpoint"] = {"problems": ["self-check failed to run: %s" % e]}
     if args.cmd == "analyze":
