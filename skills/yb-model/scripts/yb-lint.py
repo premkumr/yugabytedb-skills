@@ -369,7 +369,7 @@ def check_table(st, findings):
     return {"name": name, "short": short, "pk": pk_cols, "cols": cols}
 
 
-def check_index(st, findings, index_registry, table_cols=None):
+def check_index(st, findings, index_registry, table_cols=None, table_pk=None):
     t = st.text
     m = re.search(
         r"CREATE\s+(UNIQUE\s+)?INDEX\s+((?:NON)?CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?"
@@ -501,17 +501,32 @@ def check_index(st, findings, index_registry, table_cols=None):
                     )
                 )
 
-    if is_unique and re.search(r"\bWHERE\b", tail, re.I) is None:
-        findings.append(
-            Finding(
-                "YB027",
-                "info",
-                st.line,
-                f"{iname}: unique index. NULL is distinct from NULL, so many NULL rows are "
-                "permitted and Voyager live migration can raise false conflicts on it.",
-                "If the column is nullable, consider WHERE <col> IS NOT NULL.",
+    if is_unique and re.search(r"\bWHERE\b", tail, re.I) is None and \
+            re.search(r"\bNULLS\s+NOT\s+DISTINCT\b", tail, re.I) is None:
+        # A key column is NOT NULL when its declaration says so or it is in the primary key.
+        # An expression, or a column this DDL never declares, may be NULL.
+        decls = (table_cols or {}).get(tname, {})
+        pk_names = (table_pk or {}).get(tname, set())
+        nullable = [
+            c
+            for c, _ in cols
+            if c not in pk_names and not re.search(r"\bNOT\s+NULL\b", decls.get(c, ""), re.I)
+        ]
+        if nullable:
+            names = ", ".join(nullable)
+            guard = " AND ".join(f"{c} IS NOT NULL" for c in nullable)
+            findings.append(
+                Finding(
+                    "YB027",
+                    "info",
+                    st.line,
+                    f"{iname}: unique index on nullable column(s) {names}. NULL is distinct "
+                    "from NULL, so many NULL rows are permitted and Voyager live migration "
+                    "can raise false conflicts on it.",
+                    f"Declare {names} NOT NULL if they are never NULL, or make the index "
+                    f"partial: WHERE {guard}.",
+                )
             )
-        )
 
     inc = re.search(r"\bINCLUDE\s*\(([^)]*)\)", tail, re.I)
     include = {c.strip().strip('"').lower() for c in inc.group(1).split(",")} if inc else set()
@@ -575,7 +590,7 @@ def cross_checks(index_registry, findings, max_indexes):
                             "columns, layout and sort order, not unique, and its INCLUDE "
                             "columns are covered.",
                             "Confirm idx_scan = 0 and that no hint or constraint names it, "
-                            f"then DROP INDEX CONCURRENTLY {a_name}.",
+                            f"then DROP INDEX {a_name}.",
                         )
                     )
                 else:
@@ -588,7 +603,7 @@ def cross_checks(index_registry, findings, max_indexes):
                             "the same hash group and sort order, is not unique, and its "
                             "INCLUDE columns are covered, so it is probably redundant.",
                             "Confirm idx_scan = 0 and that no hint or constraint names it, "
-                            f"then DROP INDEX CONCURRENTLY {a_name}.",
+                            f"then DROP INDEX {a_name}.",
                         )
                     )
 
@@ -618,17 +633,18 @@ def lint(sql, max_indexes=6):
 
     # Pass 1: tables. Indexes may appear before the table they sit on, so column
     # nullability has to be collected before any index is judged.
-    table_cols = {}
+    table_cols, table_pk = {}, {}
     for st in stmts:
         if re.search(r"\bCREATE\s+(UNLOGGED\s+)?TABLE\b", st.upper):
             info = check_table(st, findings)
             if info:
                 table_cols[info["short"]] = info["cols"]
+                table_pk[info["short"]] = {c for c, _ in info["pk"]}
 
     # Pass 2: everything else.
     for st in stmts:
         if re.search(r"\bCREATE\s+(UNIQUE\s+)?INDEX\b", st.upper):
-            check_index(st, findings, index_registry, table_cols)
+            check_index(st, findings, index_registry, table_cols, table_pk)
         elif re.search(r"\bCREATE\s+SEQUENCE\b", st.upper):
             check_sequence(st, findings)
     cross_checks(index_registry, findings, max_indexes)

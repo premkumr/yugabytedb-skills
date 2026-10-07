@@ -4,7 +4,7 @@
   {
    "id": "workload",
    "tier": "major",
-   "label": "Workload: pg_stat_statements (ybm_pss.csv) or a query list (queries.sql)",
+   "label": "Workload: pg_stat_statements (ybm_pss.csv), a query list (queries.sql), or both",
    "without": "No access patterns, so nothing can be said about how the schema is read or written. The review is structural only (DDL and statistics).",
    "mutes": ["CAP001", "CAP002", "CAP003", "CAP010", "CAP011", "CAP012", "CAP020", "CAP021",
              "CAP030", "CAP031", "CAP040", "CAP050", "CAP051", "IDX001", "PLN001", "PLN002",
@@ -54,11 +54,11 @@
   {
    "id": "version",
    "tier": "major",
-   "label": "YugabyteDB release (ybm_meta.csv, from SELECT version())",
+   "label": "YugabyteDB release: SELECT version() (ybm_meta.csv), pg_settings server_version, the ysql_dump header, or stated by the user (--release)",
    "without": "Release-specific facts cannot be applied: setting defaults, features a fix relies on, and which regress tests pin each rule. Replay cannot pick an image.",
    "mutes": [],
    "stages": ["plan replay", "release defaults for planner settings", "feature-availability check of fixes", "regress-test pinning per release"],
-   "collect": "ysqlsh -f scripts/collect.sql, or tell me the output of SELECT version();"
+   "collect": "a schema dump made with ysql_dump states it in its header; otherwise ask for the output of SELECT version(); and pass --release"
   },
   {
    "id": "settings",

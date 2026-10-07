@@ -2,16 +2,17 @@
 
 ## 1. Capture commands
 
-Give the user these two commands. Run them from an empty directory, connected to the
-application database; both are read-only.
+Give the user these two commands, for whoever can connect to the application database
+(often the customer). Run them from an empty directory; both are read-only.
 
 ```bash
 ysqlsh -h <host> -U <user> -d <db> -f <skill-dir>/scripts/collect.sql
 ysql_dump -h <host> -U <user> -d <db> --schema-only --include-yb-metadata > schema.sql
 ```
 
-That directory is the bundle. It covers Round 1 and Round 3 below, plus the version,
-settings, index usage and tablet counts. Ask the rounds below only for what the bundle cannot
+That directory is the bundle. It covers Round 1 and Round 3 below, plus the release,
+settings, index usage and tablet counts. Files in other shapes are fine: SKILL.md step 1 says
+how to convert them. Ask the rounds below only for what the bundle cannot
 contain: SLOs, growth, client retry behaviour and CDC.
 
 ## 2. Question rounds

@@ -35,7 +35,13 @@ session and utility statements (`SET`, `COMMIT`, ...) and statements on tables o
 schema are not analysed; an open item lists how many there are and their share of time, and
 every share the report quotes (pattern table, headline) is a share of *all* statement time.
 
-Without `pg_stat_statements`, patterns come from `queries.sql`, are marked UNRANKED, and
+A query list (`queries.sql`) is used with or without `pg_stat_statements`. Each listed
+statement is matched to `pg_stat_statements` by fingerprint (constants and parameters as `?`,
+casts on them dropped, IN and VALUES lists collapsed). A match is ranked from
+`pg_stat_statements`; a statement it lacks is added after the ranked patterns as UNRANKED, and
+findings resting only on such statements carry the caveat
+`pattern unranked (listed, not in pg_stat_statements)`. UNRANKED patterns weigh like HOT ones,
+because their traffic is unknown. Without `pg_stat_statements`, every pattern is UNRANKED and
 severity is not traffic-weighted.
 
 ## 3. Rule families
@@ -47,7 +53,7 @@ severity is not traffic-weighted.
 | `WRK` | `pg_stat_statements`, `pg_stat_user_*` | Unused index, too many indexes on a write-hot table |
 | `SPL` | Tablet counts | Large relation still on one tablet |
 | `CFG` | `pg_settings` | Cost model off, default sharding is ASC |
-| `PLN` | Replayed plans only | Seq Scan on a large table that no static rule predicted |
+| `PLN` | Replayed plans only | Seq Scan on a large table that no static rule predicted; the fix says what the planner chose and names the pattern's other findings |
 | `LINT-YB*` | `yb-lint.py` | Clause order, missing `TABLETS` keyword, redundant prefix index |
 | `SAF` | Safety pass over the engine's own DDL | A fix that would lose a uniqueness guarantee, an ON CONFLICT target, or a plan |
 
@@ -59,8 +65,23 @@ of the headline, and words their fixes for the application team.
 `src/postgres/src/test/regress/expected/<file>` in yugabyte-db at the customer's release tag
 and search for the string. Only rules that claim planner or execution behaviour (`CAP`,
 `PLN`) cite tests, and `scripts/check-rule-refs.py` fails if one does not. `STA`, `WRK`, `CFG`,
-`SPL` and `SAF` rules are arithmetic on the bundle; their findings say *Basis: computed from
-this bundle's statistics and workload*.
+`SPL`, `SAF` and lint rules are arithmetic on the bundle; their *Basis* line names the inputs
+that rule family reads and the bundle has (for example "the schema DDL, pg_stats and row
+counts"; lint findings: the schema DDL only).
+
+**What statistics can show on YSQL.** ANALYZE fetches its sample in ybctid order, so
+`pg_stats.correlation` is agreement with the primary key's order, not with insert order: it is
+about 1 for the leading column of a range-sharded key whatever the inserts did, and noise on a
+hash-sharded table. STA004 therefore needs a sequence default (including one attached later by
+`ALTER COLUMN ... SET DEFAULT nextval` or an identity) or a time-typed or creation-named column;
+for a secondary index on a range-sharded table, correlation counts only when the primary key
+itself is insert-ordered. Measured writes raise its severity and confidence but never fire it
+alone. Unique integers spread evenly over most of their
+type's range are random identifiers and never fire it. STA006 lists only columns with no
+non-NULL value in the sample; columns an index references (key, INCLUDE or predicate), event
+timestamps and columns that hold some data are named as left out. A pg_stats export that lists
+a column twice (per-node variants) keeps one row, the one reported by most nodes when the file
+says, otherwise the first, and the open items name the columns.
 
 ## 4. Replay
 
@@ -111,13 +132,38 @@ Before the report is written, `ybm/safety.py` applies each finding's DDL to a co
 schema, alone and then all together, and compares the result with the original:
 
 - Every PRIMARY KEY and UNIQUE guarantee must survive, on the same or fewer columns and with
-  a predicate that is no narrower. If a fix would lose one, the pass adds the UNIQUE index
-  that keeps it, and marks the row `amended`.
-- Every `INSERT ... ON CONFLICT (cols)` must still have a unique index on exactly those
-  columns.
+  a predicate that is no narrower. `col IS NOT NULL` on a key column does not narrow it: rows
+  whose key holds a NULL never conflict, unless the index is NULLS NOT DISTINCT, which the
+  replacement must then keep. If a fix would lose one, the pass adds the UNIQUE
+  index that keeps it, and marks the row `amended`. Statistics rules never suggest dropping a primary
+  key or a unique index; their fix is a re-key on the same columns.
+- A foreign key depends on the unique index (or primary key) it was created against, and that
+  index cannot be dropped while the key exists. When a fix drops one, the pass re-points the
+  key: it is dropped just before the index and added back as written, `NOT VALID` and then
+  validated, provided the fix leaves a unique index without a predicate on exactly the
+  referenced columns; otherwise the DDL is withheld and the fix says why. A primary-key change
+  (a table swap) lists the foreign keys to move in its comment lines.
+- Every `INSERT ... ON CONFLICT` must still find its arbiter: a unique index on exactly its
+  columns (a partial one only when the statement repeats the predicate), or for `ON CONFLICT
+  ON CONSTRAINT name` the primary key or unique constraint of that name.
 - Every ranked pattern is planned again. Losing an access path, a point lookup, index order
   or coverage is a regression.
 - A pure `DROP INDEX` of an index that `pg_stat_user_indexes` shows was scanned is flagged.
+
+How the DDL is written: a replacement index is derived from the original
+(`schema.index_sql`), so UNIQUE (with NULLS NOT DISTINCT), INCLUDE, the predicate as written,
+the method and the SPLIT clause are carried over and a rule states only what it changes (a bucketed replacement keeps
+every original key after the bucket). Drops are `DROP INDEX` (YSQL rejects `DROP INDEX
+CONCURRENTLY`, gram.y) or `ALTER TABLE ... DROP CONSTRAINT` for the index of a UNIQUE
+constraint (ysql_dump writes one as its `CREATE UNIQUE INDEX` followed by `ADD CONSTRAINT ...
+UNIQUE USING INDEX`); a partitioned parent builds without CONCURRENTLY. A CAP060 fix names an existing
+unique index on a subset of the ON CONFLICT columns when there is one (the statement should
+target it), and otherwise hashes the new unique index on a NOT NULL, high-cardinality column.
+Names are written as YSQL needs them (quoted when mixed case, special or reserved) and an
+expression keeps the quotes of the names in it, so a quoted mixed-case schema gets the same
+recommendations as a lower-case one. A primary-key change, which YSQL cannot make in place, is
+written as comment lines (`-- CREATE TABLE ..._new (... PRIMARY KEY (...))`) that the safety
+pass reads; a colocated table gets range keys and no SPLIT clause.
 
 Side effects that cannot be amended mechanically become `SAF001`, or `SAF002` when they only
 appear once the fixes are combined.
@@ -137,6 +183,12 @@ runs reviews, for the releases being reviewed, and are never committed (`.gitign
 - `rules/observations.json`, written by `evals/yb-model/oracle.py`: which releases and
   planner modes the static model was checked on, and per-rule observations such as how
   often the planner chose a partial hash-key Index Scan and how many rows it really read.
+
+The customer's release comes from the first of these that names one: `--release` (the user
+stated it), `SELECT version()` (`ybm_meta.csv`), `pg_settings` `server_version`, the
+`ysql_dump` header (`Dumped from database version`, not the client's `Dumped by` line). The
+report names the source. Sources that disagree, and a value that names no YugabyteDB release
+(a PostgreSQL dump), are open items.
 
 The engine resolves the customer's release to the newest table entry at or below it, then:
 
@@ -198,13 +250,35 @@ touches these tables) re-enables IDX001, the coverage-based unused-index check, 
 `workload declared complete`. Duplicate and prefix-redundant indexes (linter YB052 / YB051) are
 structural and run with or without a workload.
 
+Names in the bundle files are matched to the schema exactly, as the catalog spells them (a
+quoted name keeps its case, so `"Orders"` keeps its statistics). A name that differs from the
+schema's only in case, as in a hand-made file, is matched to the one schema name it equals.
+
 Inputs are *major* (they change findings) or *minor*. A major gap makes `preflight` exit 3 and
 `review` refuse to run until `--accept-missing`, which the skill passes only after the user
 says yes. When a broader input is missing, the narrower one is not listed again (no
 pg_stat_statements implies no DocDB columns). Muting is applied in `analyze` regardless of the
 flag, so `analyze`, `review` and the fixpoint self-check all see the same rule set.
 
-## 9. What the engine does not do
+## 9. Catalog mode (experimental)
+
+`--catalog` builds the schema model from a scratch YugabyteDB the reviewer runs locally (Docker
+or Podman, a local `yugabytedb/yugabyte` image, never pulled), not from the DDL text. The
+bundle's DDL is loaded there and the model is read back from the catalog: key layouts
+(`pg_index.indoption`), the constraint behind each index, foreign keys, partitions and their
+attached indexes, colocation and tablegroups (`yb_table_properties`). Each index's canonical
+definition (`pg_get_indexdef`) goes through the ordinary CREATE INDEX reader. The rules are
+the same in both modes.
+
+- Every object is created with one tablet, so a large schema loads on one node; the declared
+  `SPLIT INTO n` counts are kept for the model.
+- When the server's errors show the dump is incomplete in a known way (a schema or a sequence
+  it never created, colocation ids from a colocated database), the gap is supplied and the
+  statements run again; each repair is listed in the review's notes.
+- A statement the server still rejects is listed, and its objects come from the DDL text.
+- Nothing connects to a customer cluster.
+
+## 10. What the engine does not do
 
 - Measure latency or tablet sizes on the live cluster.
 - Judge client retry behaviour, CDC, retention, or erasure.

@@ -22,7 +22,15 @@ from . import schema as schema_mod
 from .sqltok import tokenize, split_statements, rebase, match_paren
 from . import sqlshape
 
-REKEY = re.compile(r"--\s*CREATE TABLE (\w+)_new \(\.\.\. PRIMARY KEY \((.+)\)\)")
+# The index a table swap leaves behind on the retired table (analyze._old_index_note): gone
+# afterwards, but never a DROP INDEX the reader runs.
+RETIRED = re.compile(r'--\s*(\w+|"(?:[^"]|"")+") is not created on the new table')
+REKEY = re.compile(r'--\s*CREATE TABLE (\w+|"(?:[^"]|"")+") \(\.\.\. PRIMARY KEY \((.+)\)\)')
+
+
+class _Stmt(list):
+    """Tokens of one statement, with the SQL text their positions refer to."""
+    sql = None
 
 
 def changes_of(ddl):
@@ -33,7 +41,15 @@ def changes_of(ddl):
     for line in ddl.splitlines():
         m = REKEY.search(line)
         if m:
-            out.append(("rekey", m.group(1), m.group(2)))
+            name = m.group(1)
+            if name.startswith('"'):
+                name = name[1:-1].replace('""', '"')
+            if name.endswith("_new"):
+                out.append(("rekey", name[:-4], m.group(2)))
+        m = RETIRED.search(line)
+        if m:
+            name = m.group(1)
+            out.append(("retire", name[1:-1].replace('""', '"') if name.startswith('"') else name))
     body = "\n".join(l for l in ddl.splitlines() if not l.lstrip().startswith("--"))
     body = re.sub(r"--[^\n]*", "", body)
     for st in split_statements(tokenize(body)):
@@ -41,20 +57,37 @@ def changes_of(ddl):
         if not st:
             continue
         words = [t.up for t in st[:4] if t.kind == "word"]
+        up = [t.up for t in st if t.kind == "word"]
+        if up[:2] == ["ALTER", "TABLE"] and "DROP" in up and "CONSTRAINT" in up:
+            k = up.index("CONSTRAINT")
+            rest = [t.ident for t in st if t.kind in ("word", "qident")][k + 1:]
+            rest = [x for x in rest if x not in ("if", "exists")]
+            if rest:
+                out.append(("drop", rest[0]))
+            continue
         if words[:1] == ["DROP"] and "INDEX" in words:
             name = [t.ident for t in st if t.ident and t.up not in
                     ("DROP", "INDEX", "CONCURRENTLY", "IF", "EXISTS")][-1]
             out.append(("drop", name.split(".")[-1]))
         elif words[:1] == ["CREATE"] and "INDEX" in words:
-            out.append(("create", st))
+            stmt = _Stmt(st)
+            stmt.sql = body
+            out.append(("create", stmt))
     return out
+
+
+def an_partition_copies(sch, name):
+    from .analyze import partition_copies
+    return partition_copies(sch, name)
 
 
 def apply(sch, changes):
     after = copy.deepcopy(sch)
     for ch in changes:
-        if ch[0] == "drop":
-            after.indexes.pop(ch[1], None)
+        if ch[0] in ("drop", "retire"):  # retire: left behind with a swapped-out table
+            # Dropping a partitioned index drops every partition's copy of it.
+            for n in [ch[1]] + an_partition_copies(after, ch[1]):
+                after.indexes.pop(n, None)
         elif ch[0] == "create":
             schema_mod._parse_create_index(ch[1], after, 0)
         elif ch[0] == "rekey":
@@ -86,30 +119,74 @@ def constraints(sch):
     return out
 
 
+def _covers(w, where, keys, nulls_conflict=False):
+    """Does a unique index with predicate `w` (None: every row) check every row that one with
+    predicate `where` checks, for duplicates on `keys`? Two rows whose key holds a NULL never
+    conflict (unless NULLS NOT DISTINCT: `nulls_conflict`), so `col IS NOT NULL` on a key column
+    changes nothing; with no OR, the predicate covers at least as much when its remaining
+    conjuncts are a subset of the other's."""
+    if w is None:
+        return True
+    a, b = _norm(w), _norm(where)
+    if a == b:
+        return True
+    if " or " in " %s " % a or " or " in " %s " % (b or ""):
+        return False
+    guard = set() if nulls_conflict else {
+        "%s is not null" % k.lower() for k in keys if not k.startswith("expr:")}
+    return set(a.split(" and ")) - guard <= set(b.split(" and ") if b else []) - guard
+
+
+def _nnd(sch, name):
+    return bool(getattr(sch.indexes.get(name), "nulls_not_distinct", False))
+
+
 def lost_uniqueness(before, after):
     have = constraints(after)
     lost = []
     for table, keys, where, name in constraints(before):
-        ok = any(t == table and k <= keys and (w is None or _norm(w) == _norm(where))
-                 for t, k, w, _ in have)
+        nnd = _nnd(before, name)  # then the replacement must treat NULLs as equal too
+        ok = any(t == table and k <= keys and (not nnd or _nnd(after, n)) and
+                 _covers(w, where, keys, nnd) for t, k, w, n in have)
         if not ok:
             lost.append((table, keys, where, name))
     return lost
+
+
+def has_arbiter(sch, sh):
+    """Can INSERT ... ON CONFLICT in shape `sh` find its arbiter in `sch`? ON CONSTRAINT names
+    a primary key or unique constraint (a unique index without a constraint does not count);
+    (cols) needs a unique index on exactly those columns, a partial one only when the statement
+    repeats its predicate in ON CONFLICT (cols) WHERE ..."""
+    table = sh.tables[0]
+    if sh.conflict_constraint:
+        t = sch.tables.get(table)
+        return bool(t and t.pk and t.pk.name == sh.conflict_constraint) or any(
+            i.table == table and i.unique and getattr(i, "constraint", False) and
+            i.name == sh.conflict_constraint for i in sch.indexes.values())
+    target = frozenset(sh.conflict_cols)
+    return any(t == table and k == target and
+               (w is None or (sh.conflict_where is not None and
+                              _norm(w) == _norm(sh.conflict_where)))
+               for t, k, w, _ in constraints(sch))
+
+
+def conflict_target(sh):
+    """The ON CONFLICT target of `sh` as the report names it, or None when it has none."""
+    if sh.kind != "insert" or not sh.tables:
+        return None
+    if sh.conflict_constraint:
+        return ["ON CONSTRAINT " + sh.conflict_constraint]
+    return sorted(sh.conflict_cols) or None
 
 
 def lost_conflict_targets(before, after, patterns):
     lost = []
     for p in patterns:
         for sh in sqlshape.flatten(p["shape"]):
-            if sh.kind != "insert" or not sh.conflict_cols or not sh.tables:
-                continue
-            table, target = sh.tables[0], frozenset(sh.conflict_cols)
-
-            def has(s):
-                return any(t == table and k == target and w is None
-                           for t, k, w, _ in constraints(s))
-            if has(before) and not has(after):
-                lost.append((p["id"], table, sorted(target)))
+            target = conflict_target(sh)
+            if target and has_arbiter(before, sh) and not has_arbiter(after, sh):
+                lost.append((p["id"], sh.tables[0], target))
     return lost
 
 
@@ -176,18 +253,27 @@ def regressions(before_map, after_map, weights):
 def _index_of(sch, st):
     tmp = copy.deepcopy(sch)
     before = set(tmp.indexes)
-    schema_mod._parse_create_index(st, tmp, 0)
+    schema_mod._parse_create_index(st, tmp, 0, getattr(st, "sql", None))
     new = [tmp.indexes[n] for n in tmp.indexes if n not in before]
     return new[0] if new else None
 
 
-def _ddl_for(idx, replaced):
-    keys = idx.signature()
-    return ("CREATE %sINDEX CONCURRENTLY %s ON %s (%s)%s SPLIT INTO <n> TABLETS%s;\n"
-            "DROP INDEX CONCURRENTLY %s;  -- after %s is valid" % (
-                "UNIQUE " if idx.unique else "", idx.name, idx.table, keys,
-                (" INCLUDE (%s)" % ", ".join(idx.include)) if idx.include else "",
-                (" WHERE %s" % idx.where) if idx.where else "", replaced, idx.name))
+def _ddl_for(sch, idx, orig, splits):
+    """The merged replacement `idx` of `orig`. Its SPLIT is the original's when the key layout
+    is unchanged, otherwise the one a merged replacement chose for its new layout (bucketing)."""
+    t = sch.tables.get(orig.table)
+    same = idx.signature() == orig.signature()
+    split = None if same else next((sp for sp in splits if sp), None)
+    keys = None if same else idx.signature(quote=True)
+    base = schema_mod.Index(orig.name, orig.table, orig.keys, unique=idx.unique,
+                            include=[], where=None, split=orig.split, method=orig.method,
+                            split_sql=orig.split_sql,
+                            nulls_not_distinct=idx.nulls_not_distinct)
+    return schema_mod.index_sql(base, idx.name, keys=keys, add_include=idx.include,
+                                add_where=idx.where, split=split,
+                                colocated=sch.is_colocated(orig.table),
+                                partitioned=bool(t and t.partition_by)) + "\n" + \
+        schema_mod.drop_sql(orig, idx.name)
 
 
 def merge_replacements(sch, col):
@@ -213,21 +299,25 @@ def merge_replacements(sch, col):
         idxs = [_index_of(sch, st) for _, st in items]
         if any(i is None for i in idxs):
             continue
+        if sch.fks_on_index(orig) and any(i.where for i in idxs):
+            continue  # a partial index cannot back the foreign key: each fix is judged alone
         keys = max(idxs, key=lambda i: len(i.keys)).keys
         include = sorted({c for i in idxs for c in i.include} - {k.col for k in keys})
-        wheres = []
+        wheres, seen = [], set()
         for i in idxs:
-            for w in ([i.where] if i.where else []):
-                if w not in wheres:
-                    wheres.append(w)
+            if i.where and i.where not in seen:
+                seen.add(i.where)
+                wheres.append(i.where_sql or i.where)  # as written: keeps quoted names
         out = schema_mod.Index("%s_v2" % target, orig.table, keys,
                                unique=orig.unique or any(i.unique for i in idxs),
+                               nulls_not_distinct=orig.nulls_not_distinct,
                                include=include,
                                where=" AND ".join("(%s)" % w for w in wheres) if wheres else None)
         rank = sorted(items, key=lambda it: (["critical", "high", "medium", "low",
                                               "info"].index(it[0].severity), it[0].rule))
         lead = rank[0][0]
-        lead.ddl = _ddl_for(out, target)
+        lead.ddl = _ddl_for(sch, out, orig, [i.split_sql for i in idxs
+                                             if i.signature() == out.signature()])
         others = [f for f, _ in rank[1:]]
         for f in others:
             f.ddl = None
@@ -255,7 +345,9 @@ def reintroduced(sch_after, created_names, bundle, an):
         t = sch_after.tables.get(idx.table)
         lead = idx.keys[0]
         st = an.col_stats(bundle, sch_after, idx.table, lead.col)
+        # As STA001: under UNIQUE ... NULLS NOT DISTINCT at most one row has a NULL key.
         if lead.mode == "HASH" and st and (st["null_frac"] or 0) >= an.THRESHOLDS["null_frac_flag"] \
+                and not (idx.unique and idx.nulls_not_distinct) \
                 and not (idx.where and re.search(r"\b%s\s+is\s+not\s+null" % re.escape(lead.col),
                                                  idx.where, re.I)):
             out.append("%s hashes %s.%s again without WHERE %s IS NOT NULL (null_frac %.2f)" % (
@@ -276,6 +368,38 @@ def ddl_conflicts(all_changes):
     return out
 
 
+def _fk_backed(after, fk):
+    """Is there a unique, non-partial index (or the primary key) on exactly the columns `fk`
+    references, which the key can be created against?"""
+    t = after.tables.get(fk.ref_table)
+    if not fk.ref_cols:
+        return bool(t and t.pk)
+    want = set(fk.ref_cols)
+    return any(i.table == fk.ref_table and (i.unique or i.is_pk) and not i.where and
+               all(k.col for k in i.keys) and {k.col for k in i.keys} == want
+               for i in list(after.indexes.values()) + ([t.pk] if t and t.pk else []))
+
+
+def _repoint_fks(ddl, blocked):
+    """The DDL with each foreign key that depends on a dropped index dropped just before that
+    drop and added back after it, unvalidated and then validated, as written (options kept)."""
+    out = []
+    for line in ddl.split("\n"):
+        chs = changes_of(line)
+        fks = [fk for name, fk in blocked if chs == [("drop", name)]]
+        for fk in fks:
+            out.append("ALTER TABLE %s DROP CONSTRAINT %s;" % (schema_mod.qi(fk.table),
+                                                              schema_mod.qi(fk.name)))
+        out.append(line)
+        for fk in fks:
+            out.append("ALTER TABLE %s ADD CONSTRAINT %s %s%s;" % (
+                schema_mod.qi(fk.table), schema_mod.qi(fk.name), fk.clause,
+                "" if re.search(r"\bNOT\s+VALID\b", fk.clause, re.I) else " NOT VALID"))
+            out.append("ALTER TABLE %s VALIDATE CONSTRAINT %s;" % (schema_mod.qi(fk.table),
+                                                                  schema_mod.qi(fk.name)))
+    return "\n".join(out)
+
+
 def check(sch, patterns, col, an, ps, bundle, Finding):
     """Run the pass; amends findings in place, adds SAF findings, returns a report."""
     weights = {p["id"]: p["weight"] for p in patterns}
@@ -292,16 +416,52 @@ def check(sch, patterns, col, an, ps, bundle, Finding):
             continue
         row = {"finding_rule": f.rule, "object": f.obj, "changes": len(chs), "checks": [],
                "status": "ok"}
+        # A foreign key depends on the unique index it was created against: that index can
+        # only be dropped after the key. Re-point the key when the change leaves an index that
+        # can back it; otherwise the DDL would fail, so it is withheld. A primary-key change
+        # is a table swap whose comment lines already say to move the keys around it.
+        blocked = [(c[1], fk) for c in chs if c[0] == "drop" and c[1] in sch.indexes
+                   for fk in sch.fks_on_index(sch.indexes[c[1]])] \
+            if not any(c[0] == "rekey" for c in chs) else []
+        if blocked:
+            backed = apply(sch, chs)
+            if all(_fk_backed(backed, fk) for _, fk in blocked):
+                f.ddl = _repoint_fks(f.ddl, blocked)
+                row["checks"].append("foreign key %s re-pointed: dropped before %s and added "
+                                     "back NOT VALID, then validated" % (
+                                         ", ".join(fk.name for _, fk in blocked),
+                                         ", ".join(sorted({n for n, _ in blocked}))))
+                row["status"] = "amended"
+            else:
+                f.fix = (f.fix or "") + (" Not applied: %s, and only a unique index without a "
+                                         "predicate on exactly the referenced columns can "
+                                         "back a foreign key, so the DDL is withheld." % "; ".join(
+                                             "foreign key %s on %s depends on %s" % (
+                                                 fk.name, fk.table, n) for n, fk in blocked))
+                f.ddl = None
+                row["checks"].append("withheld: %s" % "; ".join(
+                    "foreign key %s depends on %s" % (fk.name, n) for n, fk in blocked))
+                row["status"] = "withheld"
+                report.append(row)
+                continue
         after = apply(sch, chs)
         lost = lost_uniqueness(sch, after)
         if lost:
             adds = []
             for table, keys, where, name in lost:
+                src = sch.indexes.get(name)
+                if src is not None and src.where_sql:
+                    where = src.where_sql  # as written: keeps quoted names
                 cols = sorted(keys)
                 iname = "%s_%s_uniq" % (table, "_".join(re.sub(r"\W+", "_", c) for c in cols))
-                adds.append("CREATE UNIQUE INDEX CONCURRENTLY %s ON %s ((%s) HASH)%s;  -- added "
+                keycols = [("(%s)" % c[5:]) if c.startswith("expr:") else schema_mod.qi(c)
+                           for c in cols]
+                group = ("%s" % ", ".join("%s ASC" % c for c in keycols)
+                         if sch.is_colocated(table) else "(%s) HASH" % ", ".join(keycols))
+                adds.append("CREATE UNIQUE INDEX CONCURRENTLY %s ON %s (%s)%s%s;  -- added "
                             "by the safety check: keeps the uniqueness %s enforces" % (
-                                iname, table, ", ".join(c.replace("expr:", "") for c in cols),
+                                schema_mod.qi(schema_mod.ident(iname)), schema_mod.qi(table),
+                                group, " NULLS NOT DISTINCT" if _nnd(sch, name) else "",
                                 (" WHERE %s" % where) if where else "", name))
             f.ddl = f.ddl + "\n" + "\n".join(adds)
             chs = changes_of(f.ddl)

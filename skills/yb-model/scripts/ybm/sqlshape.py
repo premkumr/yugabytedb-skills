@@ -3,7 +3,8 @@ ordered and projected. Deterministic and deliberately conservative: anything it 
 classify is recorded as 'other' rather than guessed.
 """
 
-from .sqltok import tokenize, split_statements, match_paren, split_top, text_of, is_word, rebase
+from .sqltok import (tokenize, split_statements, match_paren, split_top, text_of, expr_of,
+                     is_word, rebase)
 
 CLAUSES = ("SELECT", "FROM", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "FETCH",
            "FOR", "UNION", "INTERSECT", "EXCEPT", "RETURNING", "SET", "VALUES", "USING",
@@ -45,6 +46,8 @@ class Shape:
         self.aggregate = False      # select list has an aggregate (count, sum, ...)
         self.set_cols = set()       # update targets
         self.conflict_cols = []
+        self.conflict_where = None       # ON CONFLICT (cols) WHERE pred, as text_of writes it
+        self.conflict_constraint = None  # ON CONFLICT ON CONSTRAINT name
         self.subshapes = []
         self.unresolved = []        # column names that could not be tied to a table
         self.copy = False           # COPY (SELECT ...) TO: a bulk export, not a lookup
@@ -65,6 +68,9 @@ class Shape:
                 "select_cols": sorted([list(x) for x in self.select_cols]),
                 "group_by": self.group_by, "aggregate": self.aggregate, "set_cols": sorted(self.set_cols),
                 "conflict_cols": self.conflict_cols,
+                **({"conflict_where": self.conflict_where} if self.conflict_where else {}),
+                **({"conflict_constraint": self.conflict_constraint}
+                   if self.conflict_constraint else {}),
                 "subshapes": [s.to_dict() for s in self.subshapes],
                 "unresolved": sorted(set(self.unresolved))}
 
@@ -205,7 +211,7 @@ def _expr_pred(ctx, toks, op):
     tables = {ctx.resolve(q, c) for q, c in refs}
     tables.discard(None)
     if len(tables) == 1:
-        ctx.shape.preds.append(Pred(tables.pop(), None, op, text_of(_unqualify(toks))))
+        ctx.shape.preds.append(Pred(tables.pop(), None, op, expr_of(_unqualify(toks))))
 
 
 def _unqualify(toks):
@@ -551,11 +557,19 @@ def _analyze_tokens(st, schema, ctes=None):
         ctx.alias[name] = name
         shape.refs.append((name, name))
         for k2, t in enumerate(st):
-            if t.depth == 0 and is_word(t, "CONFLICT") and k2 + 1 < len(st) and \
-                    st[k2 + 1].kind == "(":
+            if t.depth != 0 or not is_word(t, "CONFLICT") or k2 + 1 >= len(st):
+                continue
+            if st[k2 + 1].kind == "(":
                 j = match_paren(st, k2 + 1)
                 shape.conflict_cols = [p[0].ident for p in split_top(st[k2 + 2:j])
                                        if p and p[0].ident]
+                if j + 1 < len(st) and is_word(st[j + 1], "WHERE"):  # a partial arbiter
+                    e = next((m for m in range(j + 2, len(st))
+                              if st[m].depth == 0 and is_word(st[m], "DO")), len(st))
+                    shape.conflict_where = text_of(st[j + 2:e])
+            elif is_word(st[k2 + 1], "ON") and k2 + 3 < len(st) and \
+                    is_word(st[k2 + 2], "CONSTRAINT"):
+                shape.conflict_constraint = st[k2 + 3].ident
         sel = next((k2 for k2, t in enumerate(st) if t.depth == 0 and is_word(t, "SELECT")), -1)
         if sel != -1:
             shape.subshapes.append(_analyze_tokens(rebase(st[sel:]), schema, ctes))
@@ -573,7 +587,7 @@ def _analyze_tokens(st, schema, ctes=None):
             tbl = ctx.resolve(*cr)
             shape.order.append((tbl, cr[1], direction))
         else:
-            shape.order.append((None, text_of(core), direction))
+            shape.order.append((None, expr_of(core), direction))
     shape.limit = "LIMIT" in pos or "FETCH" in pos
     return shape
 

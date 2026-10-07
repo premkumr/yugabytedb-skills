@@ -184,14 +184,43 @@ def split_top(toks, sep=","):
     return [p for p in parts if p]
 
 
-def text_of(toks):
+# Reserved key words (PostgreSQL's "reserved" and "reserved, can be function or type"): as a
+# column or table name they must be quoted, which is how ysql_dump writes them.
+_RESERVED = frozenset("""all analyse analyze and any array as asc asymmetric authorization binary
+both case cast check collate collation column concurrently constraint create cross
+current_catalog current_date current_role current_schema current_time current_timestamp
+current_user default deferrable desc distinct do else end except false fetch for foreign freeze
+from full grant group having ilike in initially inner intersect into is isnull join lateral
+leading left like limit localtime localtimestamp natural not notnull null offset on only or
+order outer overlaps placing primary references returning right select session_user similar
+some symmetric system_user table tablesample then to trailing true union unique user using
+variadic verbose when where window with""".split())
+_PLAIN = re.compile(r"^[a-z_][a-z0-9_$]*$")
+
+
+def qi(name):
+    """An identifier as SQL: bare when it is a plain lower-case name, quoted otherwise (mixed
+    case, special characters or a reserved word), so engine DDL names the same column."""
+    if _PLAIN.match(name) and name not in _RESERVED:
+        return name
+    return '"%s"' % name.replace('"', '""')
+
+
+def expr_of(toks):
+    """Normalised text of an expression that is also valid SQL: as text_of, except that a
+    quoted name keeps its quotes where it needs them (mixed case, a reserved word), so "Email"
+    and email stay distinct and the text can be written into DDL."""
+    return text_of(toks, quote=True)
+
+
+def text_of(toks, quote=False):
     """Normalised text of a token run, used to compare expressions."""
     out = []
     for t in toks:
         if t.kind == "word":
             out.append(t.text.lower())
         elif t.kind == "qident":
-            out.append(t.ident)
+            out.append(qi(t.ident) if quote else t.ident)
         else:
             out.append(t.text)
     s = " ".join(out)
@@ -201,3 +230,54 @@ def text_of(toks):
 
 def is_word(t, *words):
     return t is not None and t.kind == "word" and t.up in words
+
+
+# Words after which a minus sign belongs to the number (x = -1, LIMIT -1), not a subtraction.
+_BEFORE_VALUE = {"select", "where", "and", "or", "not", "when", "then", "else", "between",
+                 "limit", "offset", "values", "set", "returning", "in", "is", "like", "ilike"}
+# Type names that continue over more than one word.
+_TYPE_WORDS = {"double": ("precision",), "character": ("varying",), "bit": ("varying",),
+               "timestamp": ("with", "without", "time", "zone"),
+               "time": ("with", "without", "time", "zone")}
+
+
+def _skip_type(toks, j):
+    """toks[j] starts a type name after '::'; return the index after it."""
+    name = toks[j].ident
+    j += 1
+    while j + 1 < len(toks) and toks[j].kind == "." and toks[j + 1].kind in ("word", "qident"):
+        name = toks[j + 1].ident
+        j += 2
+    while j < len(toks) and toks[j].kind == "word" and toks[j].ident in _TYPE_WORDS.get(name, ()):
+        j += 1
+    if j < len(toks) and toks[j].kind == "(":
+        j = match_paren(toks, j) + 1
+    while j + 1 < len(toks) and toks[j].kind == "[" and toks[j + 1].kind == "]":
+        j += 2
+    return j
+
+
+def fingerprint(sql):
+    """The statement with every constant and parameter as ?, casts on them and a leading minus
+    dropped, IN and VALUES lists collapsed to one item, and identifiers lower-cased.
+    pg_stat_statements shows constants as $n, so a query from a list and the same statement
+    there have the same fingerprint."""
+    toks = tokenize(sql)
+    out, i, n = [], 0, len(toks)
+    while i < n:
+        t = toks[i]
+        if t.kind in ("str", "num", "param") or is_word(t, "TRUE", "FALSE"):
+            if out and out[-1] == "-" and (len(out) == 1 or out[-2] in ("(", ",") or
+                                           out[-2] in _OPS or out[-2] in _BEFORE_VALUE):
+                out.pop()
+            out.append("?")
+            i += 1
+            while i + 1 < n and toks[i].kind == "op" and toks[i].text == "::" and \
+                    toks[i + 1].kind in ("word", "qident"):
+                i = _skip_type(toks, i + 1)
+            continue
+        out.append(t.ident if t.kind in ("word", "qident") else t.text)
+        i += 1
+    s = " ".join(out)
+    s = re.sub(r"\( \?(?: , \?)+ \)", "( ? )", s)
+    return re.sub(r"\( \? \)(?: , \( \? \))+", "( ? )", s)

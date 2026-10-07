@@ -15,8 +15,8 @@ Give this to the model under test, with SKILL_DIR, BUNDLE and RUN_DIR filled in:
 > Rules: read only files under SKILL_DIR and BUNDLE. The user is not available; where the
 > skill says to ask, state the assumption and proceed. Do not connect to any database. Use
 > Docker only if the skill instructs it, and never pull images. Create files only under
-> RUN_DIR. When done, write the full deliverable (the review, then the chat message) to
-> RUN_DIR/final.md and reply with that path.
+> RUN_DIR. When done, write RUN_DIR/final.md with both parts of the deliverable: first the
+> whole review.md as you left it, then the chat message you would send. Reply with that path.
 
 ## Judge
 

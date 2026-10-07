@@ -5,8 +5,80 @@ first key column is HASH only when yb_use_hash_splitting_by_default is on and th
 neither colocated nor in a tablegroup; otherwise ASC. Every other unannotated column is ASC.
 """
 
-from .sqltok import (tokenize, split_statements, match_paren, split_top, text_of, is_word,
-                     rebase)
+import hashlib
+import re
+
+from .sqltok import (tokenize, split_statements, match_paren, split_top, text_of, expr_of,
+                     is_word, qi, rebase)
+
+IDENT_MAX = 63  # PostgreSQL truncates longer identifiers silently
+
+
+def key_group(cols, colocated, hashed=1):
+    """Key columns (as SQL) for a new index: the first `hashed` columns (all with None) form the
+    hash group and the rest are ascending; on a colocated relation every key is ascending,
+    because YSQL rejects hash keys there ("cannot colocate hash partitioned index")."""
+    if colocated:
+        return ", ".join("%s ASC" % c for c in cols)
+    n = len(cols) if hashed is None else hashed
+    return ", ".join(["(%s) HASH" % ", ".join(cols[:n])] + ["%s ASC" % c for c in cols[n:]])
+
+
+def ident(name):
+    """A generated identifier that fits the 63-byte limit: a longer one keeps a stable hash
+    suffix instead of being cut by the server (which could collide with an existing name)."""
+    if len(name) <= IDENT_MAX:
+        return name
+    return "%s_%s" % (name[:IDENT_MAX - 9], hashlib.sha1(name.encode()).hexdigest()[:8])
+
+
+def index_sql(orig, name, table=None, keys=None, add_include=(), add_where=None, split=None,
+              colocated=False, partitioned=False):
+    """CREATE INDEX for a replacement of `orig`, derived from it so that nothing is lost by
+    omission: UNIQUE (with NULLS NOT DISTINCT), INCLUDE, the predicate (as written), the method
+    and the SPLIT clause are carried over, and a rule states only what it changes.
+
+    keys: a new key list (SQL), or None to keep the original layout. add_include: columns to
+    cover. add_where: a predicate AND-ed with the original. split: the SPLIT clause for a new key
+    layout (bucketing); with the original layout the original clause is kept. A colocated
+    relation takes no SPLIT, and a partitioned parent cannot build an index CONCURRENTLY."""
+    same_keys = keys is None
+    include = list(orig.include) + sorted(set(add_include) - set(orig.include))
+    where = orig.where_sql or orig.where
+    if add_where:
+        where = "(%s) AND (%s)" % (where, add_where) if where else add_where
+    clause = None
+    if colocated:
+        clause = None
+    elif split is not None:
+        clause = split
+    elif same_keys:
+        clause = orig.split_sql or ("SPLIT %s TABLETS" % orig.split
+                                    if orig.split and orig.split.startswith("INTO") else None)
+    return "CREATE %sINDEX %s%s ON %s%s (%s)%s%s%s%s;" % (
+        "UNIQUE " if orig.unique else "", "" if partitioned else "CONCURRENTLY ",
+        qi(ident(name)), qi(table or orig.table),
+        (" USING %s" % orig.method) if orig.method not in (None, "lsm") else "",
+        keys or orig.signature(quote=True),
+        (" INCLUDE (%s)" % ", ".join(qi(c) for c in include)) if include else "",
+        " NULLS NOT DISTINCT" if orig.unique and getattr(orig, "nulls_not_distinct", False)
+        else "", (" " + clause) if clause else "", (" WHERE %s" % where) if where else "")
+
+
+def drop_sql(idx, after=None):
+    """Remove an index: DROP INDEX, or ALTER TABLE ... DROP CONSTRAINT when the index backs a
+    UNIQUE constraint (DROP INDEX on it fails: "cannot drop index ... because constraint ...
+    requires it", pinned in yb.port.create_index.out)."""
+    if getattr(idx, "constraint", False):
+        return "ALTER TABLE %s DROP CONSTRAINT %s;%s" % (
+            qi(idx.table), qi(idx.name), ("  -- after %s is valid" % after) if after else "")
+    return drop_index_sql(idx.name, after)
+
+
+def drop_index_sql(name, after=None):
+    """DROP INDEX as YSQL accepts it: the grammar rejects DROP INDEX CONCURRENTLY (gram.y,
+    parser_ybc_not_support), so no CONCURRENTLY here."""
+    return "DROP INDEX %s;%s" % (qi(name), ("  -- after %s is valid" % after) if after else "")
 
 
 class KeyCol:
@@ -20,6 +92,11 @@ class KeyCol:
     def label(self):
         return self.col if self.col else "(%s)" % self.expr
 
+    @property
+    def sql(self):
+        """The key as DDL: a quoted name where needed, an expression as written."""
+        return qi(self.col) if self.col else "(%s)" % self.expr
+
     def to_dict(self):
         return {"col": self.col, "expr": self.expr, "mode": self.mode,
                 "explicit": self.explicit}
@@ -27,7 +104,8 @@ class KeyCol:
 
 class Index:
     def __init__(self, name, table, keys, unique=False, include=None, where=None,
-                 split=None, is_pk=False, method="lsm", line=0):
+                 split=None, is_pk=False, method="lsm", line=0, split_sql=None, where_sql=None,
+                 constraint=False, nulls_not_distinct=False):
         self.name = name
         self.table = table
         self.keys = keys
@@ -38,6 +116,10 @@ class Index:
         self.is_pk = is_pk
         self.method = method
         self.line = line
+        self.split_sql = split_sql  # the SPLIT clause exactly as written, or None
+        self.where_sql = where_sql  # the predicate exactly as written, or None
+        self.constraint = constraint  # backs a UNIQUE constraint: dropped with ALTER TABLE
+        self.nulls_not_distinct = nulls_not_distinct  # UNIQUE ... NULLS NOT DISTINCT
 
     @property
     def hash_cols(self):
@@ -56,12 +138,14 @@ class Index:
     def key_names(self):
         return [k.col for k in self.keys if k.col]
 
-    def signature(self):
+    def signature(self, quote=False):
+        """The key layout, as text (quote=False) or as DDL (quote=True)."""
+        lab = (lambda k: k.sql) if quote else (lambda k: k.label)
         if self.hash_cols:
-            h = "(%s) HASH" % ", ".join(k.label for k in self.hash_cols)
-            rest = ["%s %s" % (k.label, k.mode) for k in self.range_cols]
+            h = "(%s) HASH" % ", ".join(lab(k) for k in self.hash_cols)
+            rest = ["%s %s" % (lab(k), k.mode) for k in self.range_cols]
             return ", ".join([h] + rest)
-        return ", ".join("%s %s" % (k.label, k.mode) for k in self.keys)
+        return ", ".join("%s %s" % (lab(k), k.mode) for k in self.keys)
 
     def to_dict(self):
         return {"name": self.name, "table": self.table, "unique": self.unique,
@@ -73,7 +157,7 @@ class Index:
 class Table:
     def __init__(self, name, line=0):
         self.name = name
-        self.cols = {}          # name -> {"type": str, "notnull": bool}
+        self.cols = {}          # name -> {"type": str, "notnull": bool, "sequence": bool}
         self.col_order = []
         self.pk = None          # Index
         self.partition_by = None  # (method, [cols])
@@ -95,10 +179,21 @@ class Table:
                 "tablegroup": self.tablegroup, "split": self.split}
 
 
+class ForeignKey:
+    def __init__(self, name, table, cols, ref_table, ref_cols, clause):
+        self.name = name            # the constraint's name
+        self.table = table          # the referencing table
+        self.cols = cols
+        self.ref_table = ref_table
+        self.ref_cols = ref_cols    # None: the referenced table's primary key
+        self.clause = clause        # FOREIGN KEY (...) REFERENCES ... [options], as written
+
+
 class Schema:
     def __init__(self):
         self.tables = {}
         self.indexes = {}
+        self.foreign_keys = []
         self.db_colocated = False
         self.hash_default = True
         self.parse_notes = []
@@ -106,6 +201,21 @@ class Schema:
     # --- lookups -------------------------------------------------------------
     def table(self, name):
         return self.tables.get(name)
+
+    def fks_on_index(self, idx):
+        """Foreign keys that may depend on `idx`: a foreign key is created against a unique,
+        non-partial index (or the primary key) on exactly the columns it references, and that
+        index cannot be dropped while the key exists."""
+        if not (idx.unique or idx.is_pk) or idx.where or not all(k.col for k in idx.keys):
+            return []
+        keys = {k.col for k in idx.keys}
+        t = self.tables.get(idx.table)
+        pk = {k.col for k in t.pk.keys} if t and t.pk else set()
+        return [fk for fk in self.foreign_keys if fk.ref_table == idx.table and
+                (set(fk.ref_cols) if fk.ref_cols else pk) == keys]
+
+    def fks_referencing(self, table):
+        return [fk for fk in self.foreign_keys if fk.ref_table == table]
 
     def indexes_on(self, table, own_only=False):
         """Access paths for a table. A partitioned parent with no index of its own is read
@@ -125,6 +235,20 @@ class Schema:
                 if i.signature() not in have:
                     have.add(i.signature())
                     out.append(i)
+        return out
+
+    def dependents(self, table, col):
+        """Indexes on `table` (the primary key included) whose key, INCLUDE list or predicate
+        references `col`. Dropping the column drops every one of them."""
+        pat = re.compile(r"\b%s\b" % re.escape(col))
+        out = []
+        for idx in self.indexes_on(table, own_only=True):
+            if any(k.col == col or (k.expr and pat.search(k.expr)) for k in idx.keys):
+                out.append((idx.name, "key"))
+            elif col in idx.include:
+                out.append((idx.name, "INCLUDE"))
+            elif idx.where and pat.search(idx.where):
+                out.append((idx.name, "predicate"))
         return out
 
     def is_colocated(self, table):
@@ -212,7 +336,7 @@ def _parse_keys(toks):
             if simple and len(items) == 1:
                 keys.append(KeyCol(col=items[0][0].ident, mode=mode))
                 continue
-            keys.append(KeyCol(expr=text_of(inner), mode=mode))
+            keys.append(KeyCol(expr=expr_of(inner), mode=mode))
             continue
         if part[0].ident is not None and (len(part) == 1 or part[1].kind != "("):
             keys.append(KeyCol(col=part[0].ident, mode=mode))
@@ -223,7 +347,7 @@ def _parse_keys(toks):
             if t.depth == 0 and is_word(t, "HASH", "ASC", "DESC", "NULLS", "COLLATE"):
                 stop = k
                 break
-        keys.append(KeyCol(expr=text_of(part[:stop]), mode=mode))
+        keys.append(KeyCol(expr=expr_of(part[:stop]), mode=mode))
     return keys
 
 
@@ -257,7 +381,7 @@ def _find_top(toks, word, start=0):
     return -1
 
 
-def _parse_create_table(st, schema, line):
+def _parse_create_table(st, schema, line, sql=None):
     i = 1
     i = _skip_words(st, i, "GLOBAL", "LOCAL", "TEMP", "TEMPORARY", "UNLOGGED")
     if not is_word(st[i] if i < len(st) else None, "TABLE"):
@@ -286,23 +410,37 @@ def _parse_create_table(st, schema, line):
     for el in body_cols:
         el = rebase(el)
         head = el[0]
+        cons = None
         if is_word(head, "CONSTRAINT"):
+            cons = el[1].ident if len(el) > 1 else None
             el = el[2:]
             head = el[0] if el else None
         if head is None:
             continue
         if is_word(head, "PRIMARY") and len(el) > 2 and el[2].kind == "(":
             j = match_paren(el, 2)
-            t.pk = Index(name + "_pkey", name, _parse_keys(el[3:j]), unique=True, is_pk=True,
-                         line=line)
+            t.pk = Index(cons or name + "_pkey", name, _parse_keys(el[3:j]), unique=True,
+                         is_pk=True, line=line)
             continue
-        if is_word(head, "UNIQUE") and len(el) > 1 and el[1].kind == "(":
-            j = match_paren(el, 1)
-            iname = "%s_%s_key" % (name, "_".join(text_of([x]) for x in el[2:j] if x.ident))
-            schema.indexes[iname] = Index(iname, name, _parse_keys(el[2:j]), unique=True,
-                                          line=line)
+        nnd, m = _nulls_clause(el, 1) if is_word(head, "UNIQUE") else (False, 1)
+        if is_word(head, "UNIQUE") and len(el) > m and el[m].kind == "(":
+            j = match_paren(el, m)
+            iname = cons or "%s_%s_key" % (name, "_".join(text_of([x]) for x in el[m + 1:j]
+                                                             if x.ident))
+            schema.indexes[iname] = Index(iname, name, _parse_keys(el[m + 1:j]), unique=True,
+                                          line=line, constraint=True, nulls_not_distinct=nnd)
             continue
-        if is_word(head, "CHECK", "FOREIGN", "EXCLUDE", "LIKE"):
+        if is_word(head, "FOREIGN") and len(el) > 2 and el[2].kind == "(":
+            e = match_paren(el, 2)
+            fcols = [p[0].ident for p in split_top(el[3:e]) if p and p[0].ident]
+            r = e + 1
+            if r < len(el) and is_word(el[r], "REFERENCES"):
+                ref, rcols, m = _references(el, r)
+                schema.foreign_keys.append(ForeignKey(
+                    cons or "%s_%s_fkey" % (name, "_".join(fcols)), name, fcols, ref, rcols,
+                    _raw(sql, el[:m])))
+            continue
+        if is_word(head, "CHECK", "EXCLUDE", "LIKE"):
             continue
         if head.ident is None:
             continue
@@ -314,6 +452,11 @@ def _parse_create_table(st, schema, line):
             typ_toks.append(el[k])
             k += 1
         rest = [x.up for x in el[k:] if x.depth == 0 and x.kind == "word"]
+        # Filled from a sequence: serial types, DEFAULT nextval(...), or an identity column.
+        sequence = text_of(typ_toks) in ("serial", "bigserial", "smallserial", "serial2",
+                                         "serial4", "serial8") or \
+            ("DEFAULT" in rest and any(x.kind == "word" and x.up == "NEXTVAL" for x in el[k:])) or \
+            ("GENERATED" in rest and "IDENTITY" in rest)
         notnull = False
         for a, b in zip(rest, rest[1:]):
             if a == "NOT" and b == "NULL":
@@ -326,13 +469,24 @@ def _parse_create_table(st, schema, line):
                     mode = x.up
             t.pk = Index(name + "_pkey", name, [KeyCol(col=cname, mode=mode)], unique=True,
                          is_pk=True, line=line)
+        r = next((m for m in range(k, len(el)) if el[m].depth == 0 and
+                  is_word(el[m], "REFERENCES")), None)
+        if r is not None:
+            ref, rcols, m = _references(el, r)
+            fname = el[r - 1].ident if r >= 2 and is_word(el[r - 2], "CONSTRAINT") else None
+            schema.foreign_keys.append(ForeignKey(
+                fname or "%s_%s_fkey" % (name, cname), name, [cname], ref, rcols,
+                "FOREIGN KEY (%s) %s" % (qi(cname), _raw(sql, el[r:m]))))
         if "UNIQUE" in rest:
             iname = "%s_%s_key" % (name, cname)
+            u = rest.index("UNIQUE")
             schema.indexes[iname] = Index(iname, name, [KeyCol(col=cname)], unique=True,
-                                          line=line)
+                                          line=line, constraint=True,
+                                          nulls_not_distinct=rest[u + 1:u + 4] ==
+                                          ["NULLS", "NOT", "DISTINCT"])
         if cname not in t.cols:
             t.col_order.append(cname)
-        t.cols[cname] = {"type": text_of(typ_toks), "notnull": notnull}
+        t.cols[cname] = {"type": text_of(typ_toks), "notnull": notnull, "sequence": sequence}
     if t.pk:
         for k in t.pk.keys:
             if k.col in t.cols:
@@ -363,7 +517,51 @@ def _parse_create_table(st, schema, line):
         t.pk.split = t.split
 
 
-def _parse_create_index(st, schema, line):
+def _raw(sql, toks):
+    """The original text of a token run, or None without the source."""
+    if sql is None or not toks:
+        return None
+    return sql[toks[0].pos:toks[-1].pos + len(toks[-1].text)]
+
+
+def _references(toks, r):
+    """(referenced table, referenced columns or None, index after the clause) for REFERENCES at
+    r with its options (ON DELETE / ON UPDATE actions, MATCH, DEFERRABLE, INITIALLY)."""
+    ref, m = _name(toks, r + 1)
+    cols = None
+    if m < len(toks) and toks[m].kind == "(":
+        e = match_paren(toks, m)
+        cols = [p[0].ident for p in split_top(toks[m + 1:e]) if p and p[0].ident]
+        m = e + 1
+    while m < len(toks) and toks[m].depth == 0:
+        if is_word(toks[m], "ON") and m + 2 < len(toks):
+            m += 2  # ON DELETE | ON UPDATE
+            if is_word(toks[m], "NO", "SET"):
+                m += 1
+            m += 1
+            if m < len(toks) and toks[m].kind == "(":  # SET NULL (cols)
+                m = match_paren(toks, m) + 1
+        elif is_word(toks[m], "MATCH", "INITIALLY"):
+            m += 2
+        elif is_word(toks[m], "DEFERRABLE"):
+            m += 1
+        elif is_word(toks[m], "NOT") and m + 1 < len(toks) and is_word(toks[m + 1], "DEFERRABLE"):
+            m += 2
+        else:
+            break
+    return ref, cols, m
+
+
+def _nulls_clause(toks, i):
+    """(nulls_not_distinct, index after the clause) for an optional NULLS [NOT] DISTINCT at i."""
+    if i < len(toks) and is_word(toks[i], "NULLS"):
+        if i + 2 < len(toks) and is_word(toks[i + 1], "NOT") and is_word(toks[i + 2], "DISTINCT"):
+            return True, i + 3
+        return False, i + 2
+    return False, i
+
+
+def _parse_create_index(st, schema, line, sql=None):
     i = 1
     unique = False
     if is_word(st[i], "UNIQUE"):
@@ -392,14 +590,18 @@ def _parse_create_index(st, schema, line):
     j = match_paren(st, i)
     keys = _parse_keys(st[i + 1:j])
     i = j + 1
-    include, where, split = [], None, None
+    include, where, split, split_sql, where_sql = [], None, None, None, None
     k = _find_top(st, "INCLUDE", i)
     if k != -1 and st[k + 1].kind == "(":
         e = match_paren(st, k + 1)
         include = [p[0].ident for p in split_top(st[k + 2:e]) if p and p[0].ident]
+    k = _find_top(st, "NULLS", i)
+    nnd = k != -1 and _nulls_clause(st, k)[0]
     k = _find_top(st, "SPLIT", i)
     if k != -1:
         split = _split_clause(st, k)
+        w = _find_top(st, "WHERE", k)
+        split_sql = _raw(sql, st[k:w if w != -1 else len(st)])
     k = _find_top(st, "WHERE", i)
     if k != -1:
         end = len(st)
@@ -407,6 +609,7 @@ def _parse_create_index(st, schema, line):
         if s2 != -1:
             end = s2
         where = text_of(st[k + 1:end])
+        where_sql = _raw(sql, st[k + 1:end])
     if not iname:
         iname = "%s_%s_idx" % (tname, "_".join(kc.col or "expr" for kc in keys))
     if method not in ("lsm", "btree", "hash"):
@@ -415,15 +618,25 @@ def _parse_create_index(st, schema, line):
                                   % (iname, method))
     schema.indexes[iname] = Index(iname, tname, keys, unique=unique, include=include,
                                   where=where, split=split, method=method if method != "btree"
-                                  else "lsm", line=line)
+                                  else "lsm", line=line, split_sql=split_sql,
+                                  where_sql=where_sql, nulls_not_distinct=nnd)
 
 
-def _parse_alter_table(st, schema, line):
+def _parse_alter_table(st, schema, line, sql=None):
     i = 2
     i = _skip_words(st, i, "IF", "EXISTS", "ONLY")
     tname, i = _name(st, i)
     if not tname:
         return
+    # ysql_dump attaches sequences after the table: ALTER COLUMN c SET DEFAULT nextval(...),
+    # or ALTER COLUMN c ADD GENERATED ... AS IDENTITY.
+    k = _find_top(st, "COLUMN", i)
+    t = schema.tables.get(tname)
+    if k != -1 and t is not None and k > 0 and is_word(st[k - 1], "ALTER") and \
+            k + 1 < len(st) and st[k + 1].ident in t.cols:
+        words = [x.up for x in st[k + 2:] if x.kind == "word"]
+        if ("DEFAULT" in words and "NEXTVAL" in words) or "IDENTITY" in words:
+            t.cols[st[k + 1].ident]["sequence"] = True
     k = _find_top(st, "ATTACH", i)
     if k != -1 and is_word(st[k + 1], "PARTITION"):
         child, _ = _name(st, k + 2)
@@ -450,11 +663,29 @@ def _parse_alter_table(st, schema, line):
             for kc in t.pk.keys:
                 if kc.col in t.cols:
                     t.cols[kc.col]["notnull"] = True
-    elif is_word(st[j], "UNIQUE") and st[j + 1].kind == "(":
-        e = match_paren(st, j + 1)
+    elif is_word(st[j], "UNIQUE") and st[_nulls_clause(st, j + 1)[1]].kind == "(":
+        nnd, m = _nulls_clause(st, j + 1)
+        e = match_paren(st, m)
         iname = cname or "%s_key" % tname
-        schema.indexes[iname] = Index(iname, tname, _parse_keys(st[j + 2:e]), unique=True,
-                                      line=line)
+        schema.indexes[iname] = Index(iname, tname, _parse_keys(st[m + 1:e]), unique=True,
+                                      line=line, constraint=True, nulls_not_distinct=nnd)
+    elif is_word(st[j], "FOREIGN") and is_word(st[j + 1], "KEY") and st[j + 2].kind == "(":
+        e = match_paren(st, j + 2)
+        fcols = [p[0].ident for p in split_top(st[j + 3:e]) if p and p[0].ident]
+        if e + 1 < len(st) and is_word(st[e + 1], "REFERENCES"):
+            ref, rcols, m = _references(st, e + 1)
+            schema.foreign_keys.append(ForeignKey(
+                cname or "%s_%s_fkey" % (tname, "_".join(fcols)), tname, fcols, ref, rcols,
+                _raw(sql, st[j:m])))
+    elif is_word(st[j], "UNIQUE") and is_word(st[j + 1], "USING") and is_word(st[j + 2], "INDEX"):
+        # How ysql_dump writes a unique constraint (pg_dump.c): the index first, then the
+        # constraint over it. The index is renamed to the constraint's name.
+        src, _ = _name(st, j + 3)
+        idx = schema.indexes.pop(src, None)
+        if idx is not None:
+            idx.name = cname or src
+            idx.constraint = True
+            schema.indexes[idx.name] = idx
 
 
 def parse(sql, db_colocated=None, hash_default=True):
@@ -476,11 +707,11 @@ def parse(sql, db_colocated=None, hash_default=True):
                     if "colocation=true" in txt or "colocated=true" in txt:
                         schema.db_colocated = True
                 elif any(is_word(x, "TABLE") for x in st[1:4]):
-                    _parse_create_table(st, schema, line)
+                    _parse_create_table(st, schema, line, sql)
                 elif any(is_word(x, "INDEX") for x in st[1:3]):
-                    _parse_create_index(st, schema, line)
+                    _parse_create_index(st, schema, line, sql)
             elif is_word(st[0], "ALTER") and len(st) > 1 and is_word(st[1], "TABLE"):
-                _parse_alter_table(st, schema, line)
+                _parse_alter_table(st, schema, line, sql)
         except IndexError:
             schema.parse_notes.append("could not parse statement at line %d" % line)
     if db_colocated is not None:

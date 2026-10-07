@@ -181,7 +181,7 @@
       "kind": "stats",
       "severity": "high",
       "title": "Nullable leading hash column holds many NULLs",
-      "mechanism": "All NULLs hash to one code, so they land in one tablet. A tablet whose split key would reduce to that single hash code cannot be split, so it grows without bound.",
+      "mechanism": "All NULLs hash to one code, so they land in one tablet. A tablet whose split key would reduce to that single hash code cannot be split, so it grows without bound. A unique index declared NULLS NOT DISTINCT admits at most one NULL key and is exempt.",
       "fix": "Add WHERE <col> IS NOT NULL to the index (split clause before WHERE) and size SPLIT INTO for the remaining rows. Patterns must then carry the predicate (see CAP021).",
       "test": []
     },
@@ -205,7 +205,7 @@
       "kind": "stats",
       "severity": "high",
       "title": "Monotonic leading range key on a written table",
-      "mechanism": "Physical order tracks insertion order (|correlation| near 1), so every insert lands in the last range tablet. That tablet is a write hotspot, and splitting only moves the hotspot to the new last tablet.",
+      "mechanism": "When values arrive in increasing order (a sequence, a creation timestamp), every insert lands in the last range tablet. That tablet is a write hotspot, and splitting only moves the hotspot to the new last tablet. In YSQL, pg_stats correlation measures agreement with the primary key order, not insert order, so the rule needs a sequence default, a time-typed or creation-named column, or (for a secondary index) correlation with a primary key that is itself insert-ordered. Measured writes raise its severity and confidence but never fire it alone.",
       "fix": "See the finding: HASH the key, or bucket a secondary index.",
       "test": []
     },
@@ -213,7 +213,7 @@
       "kind": "stats",
       "severity": "info",
       "title": "Unique index on a column that contains NULLs",
-      "mechanism": "NULLs are distinct by default, so the unique index does not stop duplicate NULL rows.",
+      "mechanism": "NULLs are distinct by default, so the unique index does not stop duplicate NULL rows (NULLS NOT DISTINCT does, and is exempt).",
       "fix": "Confirm intent; use NULLS NOT DISTINCT or a partial index if NULL must be unique.",
       "test": []
     },
@@ -238,7 +238,7 @@
       "severity": "medium",
       "title": "Index never scanned",
       "mechanism": "idx_scan is 0 since statistics were last reset, yet every write to the table maintains the index as an extra participant.",
-      "fix": "Confirm the stats window covers all workloads (batch, month-end), then DROP INDEX CONCURRENTLY.",
+      "fix": "Confirm the stats window covers all workloads (batch, month-end), then DROP INDEX (YSQL rejects the CONCURRENTLY form of DROP INDEX).",
       "test": []
     },
     "WRK004": {
@@ -362,9 +362,9 @@
     "STA006": {
       "kind": "stats",
       "severity": "low",
-      "title": "Columns that are entirely NULL",
-      "mechanism": "A column that is NULL in every row carries no data but still costs schema surface, ORM mapping and row width in replication and CDC.",
-      "fix": "Confirm with the application owners whether the columns are still needed; drop them in a migration if not.",
+      "title": "Columns never set in the sampled rows",
+      "mechanism": "A column with no non-NULL value in the sampled rows carries no data but still costs schema surface, ORM mapping and row width in replication and CDC. Columns an index references, event timestamps that stay NULL until the event happens, and columns that hold some data are left out.",
+      "fix": "Ask the application owners whether these columns are still written. Dropping a column also drops every index whose key, INCLUDE list or predicate references it; the columns listed are referenced by none.",
       "test": []
     },
     "STA007": {
@@ -547,8 +547,8 @@
       "kind": "capability",
       "severity": "high",
       "title": "ON CONFLICT target has no matching unique index",
-      "mechanism": "INSERT ... ON CONFLICT (cols) needs a unique index or constraint whose key columns are exactly cols (in any order; a partial one only with a matching WHERE). Without one the statement fails with 'there is no unique or exclusion constraint matching the ON CONFLICT specification' on every execution, so the idempotent write it was meant to provide never happens.",
-      "fix": "Create a unique index on exactly the conflict columns, or change the ON CONFLICT target to the columns of an existing unique index. If both keys must be unique, keep both indexes.",
+      "mechanism": "INSERT ... ON CONFLICT (cols) needs a unique index or constraint whose key columns are exactly cols (in any order; a partial one only when the statement repeats its predicate in ON CONFLICT (cols) WHERE ...). ON CONFLICT ON CONSTRAINT name needs a primary key or unique constraint of that name; a unique index that backs no constraint cannot be named. Without one the statement fails with 'there is no unique or exclusion constraint matching the ON CONFLICT specification' on every execution, so the idempotent write it was meant to provide never happens.",
+      "fix": "Create a unique index on exactly the conflict columns, or change the ON CONFLICT target to the columns of an existing unique index. If both keys must be unique, keep both indexes. For a partial unique index, repeat its predicate in the statement.",
       "test": [
         {
           "file": "yb.port.insert_conflict.out",

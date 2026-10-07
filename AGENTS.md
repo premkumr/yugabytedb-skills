@@ -208,6 +208,20 @@ including iterative rule improvements, follow these rules:
 - **No customer data.** Customer schemas, statistics and reviews go under
   `evals/yb-model/fixtures-private/` (ignored). Nothing derived from them, including names,
   numbers and commit messages, goes into a commit.
+- **Recommended DDL must run on YSQL and lose nothing by omission.** Write replacement indexes
+  with `schema.index_sql` (it carries UNIQUE, INCLUDE, the predicate and SPLIT) and drops with
+  `schema.drop_sql` (plain `DROP INDEX`, or `ALTER TABLE ... DROP CONSTRAINT` for a
+  constraint's index; YSQL rejects `DROP INDEX CONCURRENTLY`). Write names with `schema.qi`
+  and expressions with `sqltok.expr_of`, so quoted mixed-case names keep their quotes; the
+  `Metamorphic` tests review the fixture again with every name quoted and as a colocated
+  database, and a new template must pass both. A fix that removes something (an index, a key,
+  a column) carries DDL the safety pass checks; prose alone never recommends dropping a primary
+  key, a unique index or a column that an index references.
+- **State what a statistic can show on YSQL.** For example, `pg_stats.correlation` follows the
+  primary key's order, not insert order. A rule that reads a statistic says what it rests on,
+  and holds back rather than guesses when the statistic cannot decide.
+- **The chat message is engine-written.** `review` writes `chat.md` from `review.json`; the
+  skill pastes it. Do not move wording the user sees back into model-written text.
 - **Keep PRs reviewable.** The hosted reviewer stops at 3,000 changed lines; split larger
   changes into stacked PRs, each building on the one before.
 - **Test before opening the PR:**

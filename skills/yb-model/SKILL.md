@@ -1,15 +1,16 @@
 ---
 name: yb-model
-description: "Complete review of an existing YugabyteDB YSQL schema and data model: primary keys and sharding, indexes, partitions, tablet splits, data quality and how the workload uses them, judged against every piece of evidence available (the schema dump, pg_stats, pg_stat_statements, row counts, planner settings, index usage and tablet counts). Use when the user asks to review, validate or audit a YSQL schema or data model, or shares a schema dump or statistics bundle and asks whether it holds up. Triggers on schema review, data model review, ysql_dump, pg_stats, pg_stat_statements, collect.sql, hot shards, tablet skew, unused or redundant indexes, yb-model. For writing a new schema, application code or a migration plan, use the ysql skill instead."
+description: "Offline review of an existing YugabyteDB YSQL schema and data model from evidence captured on the running database: a ysql_dump of the schema, plus pg_stats, pg_stat_statements or a query list, row counts and planner settings when available. Finds key and sharding problems (hot shards, tablet skew), unused or redundant indexes, partition and tablet-split gaps and data-quality issues, with deterministic findings and safety-checked DDL. Use when the user hands over a YugabyteDB schema dump or capture bundle and asks whether the schema or data model holds up, or why a table or tablet is hot, for example \"review this ysql_dump\" or \"audit our data model before go-live\". Not for: a slow query, or pg_stat_statements output without a schema (yb-query-analysis); node metrics such as CPU, memory or I/O (yb-metrics-analysis); an open-ended universe health check (yb-performance-assessment); designing a new schema, application code, or a PostgreSQL schema being migrated (ysql)."
 ---
 
 # YugabyteDB schema review
 
 This skill reviews an existing schema, completely, from as much evidence as the user can
-give: the more of the bundle in step 1 exists, the more of the engine runs. It does not
-design new schemas, write application code or plan migrations; for those, use the `ysql`
-skill, whose Voyager reference covers migrations. If the user has only DDL, review it
-and the report labels the result a structural review.
+give: the more of the bundle in step 1 exists, the more of the engine runs. The review runs
+offline, on files; nobody needs access to the customer's cluster. If the user has only DDL,
+review it and the report labels the result a structural review. If the user has no schema,
+only a slow query or `pg_stat_statements` output, this is not a schema review: see
+[Other skills](#other-skills).
 
 **Scope guard.** YugabyteDB YSQL only. Do not apply these rules to plain PostgreSQL work.
 
@@ -18,11 +19,12 @@ and the report labels the result a structural review.
 The findings come from a deterministic engine, `scripts/yb-model.py`. Its rules live in
 `rules/rules.json`. A rule that claims planner or execution behaviour cites the yugabyte-db
 regress test that pins it; statistics, workload and configuration rules are arithmetic on the
-customer's own data, and their findings say "computed from the bundle". The same inputs give
-the same findings, severities, ranking and DDL, whichever model runs the skill.
+customer's own data, and their findings say which inputs they were computed from. The same
+inputs give the same findings, severities, ranking, DDL and chat message, whichever model runs
+the skill.
 
-Your job is to collect the inputs, run the engine, write a short summary and say what was
-not verified. **Do not add, drop, re-rank, re-word or re-grade findings yourself.** If you
+Your job is to collect the inputs, run the engine, add only the context the engine cannot know
+and say what was not verified. **Do not add, drop, re-rank, re-word or re-grade findings yourself.** If you
 believe a finding is wrong or something is missing, write it under *Reviewer notes* with the
 finding ID, or "not in engine". Never edit the findings table by hand.
 
@@ -41,21 +43,21 @@ Copy this checklist and tick it off.
 ```
 - [ ] 1. Inputs gathered into one directory
 - [ ] 1b. Preflight ran; if it asked, the user said yes or no
-- [ ] 2. Engine ran (review.md and review.json exist)
+- [ ] 2. Engine ran (review.md, review.json and chat.md exist)
 - [ ] 3. Replay ran, or the reason it did not is recorded
-- [ ] 4. Summary written into review.md
+- [ ] 4. User context added to review.md, or the NOTES line deleted
 - [ ] 5. Limitations stated
 - [ ] 6. (optional) Second pass recorded under Reviewer notes
 ```
 
 ### 1. Gather
 
-A complete review needs the complete bundle, so ask for it before running anything. If the
-user can reach the cluster, give them the two capture commands in `references/intake.md` §1
-(`ysql_dump --include-yb-metadata` and `scripts/collect.sql`): together they write every file
-the engine reads, namely statistics, workload, row counts, planner settings, index usage,
-tablet counts and the release. Take whatever they can give; preflight (step 1b) names what is
-still missing.
+A complete review needs the complete bundle, so ask for it before running anything. Whoever
+can connect to the database (the user, or the customer through them) runs the two capture
+commands in `references/intake.md` §1 (`ysql_dump --include-yb-metadata` and
+`scripts/collect.sql`): together they write every file the engine reads, namely statistics,
+workload, row counts, planner settings, index usage, tablet counts and the release. Take
+whatever they can give; preflight (step 1b) names what is still missing.
 
 Make one directory (the *bundle*) and put the DDL in `schema.sql`. Copy every file the user
 gave you into it unchanged:
@@ -64,12 +66,25 @@ gave you into it unchanged:
 - A `pg_stat_statements` export, saved as `ybm_pss.csv`.
 - A `pg_stats` export, saved as `ybm_pg_stats.csv`.
 
-If the user pasted queries but has no `pg_stat_statements`, write them to `queries.sql`,
-one statement per `;`. Keep parameters typed the way the application sends them (for example
-`$2::boolean` where a parameter appears only in `$2 IS NULL`), so replay can plan them. If, and
-only if, the user or their document states that no other statement touches these tables, make
-the first line `-- ybm: workload-complete`. Unused-index checks (IDX001) then run on the list,
-marked as resting on that statement. Never add it on your own judgement.
+Exports often arrive in another shape (tab-separated, document or spreadsheet tables,
+aggregates over nodes). Look at what you were given first, then write a one-off converter
+into the layout above. Keep the originals, change no values, and say in the NOTES line what you
+mapped and what you could not. Keep every row: if an aggregated pg_stats export lists a column
+more than once (per-node variants), the engine keeps one row by a stated rule and names the
+columns in its open items.
+
+Write any query list the user gives to `queries.sql`, one statement per `;`, whether or not
+there is a `pg_stat_statements` export. The engine uses both: a listed statement found in
+`pg_stat_statements` is ranked from it, and one it lacks is added unranked. Keep parameters
+typed the way the application sends them (for example `$2::boolean` where a parameter appears
+only in `$2 IS NULL`), so replay can plan them. If, and only if, the user or their document
+states that no other statement touches these tables, make the first line
+`-- ybm: workload-complete`. Unused-index checks (IDX001) then run on the list, marked as
+resting on that statement. Never add it on your own judgement.
+
+The release is read from `SELECT version()` (`ybm_meta.csv`), `pg_settings`
+(`server_version`) or the `ysql_dump` header. If the user states it, or it is only in some
+other file, pass `--release <a.b.c.d>` to `preflight` and `review`.
 
 ### 1b. Preflight: confirm before reviewing with missing inputs
 
@@ -104,9 +119,9 @@ re-derive it.
 python3 <skill-dir>/scripts/yb-model.py review <bundle>
 ```
 
-Add no flags other than `--accept-missing` (step 1b). The engine runs replay by itself when Docker has a `yugabytedb/yugabyte`
-image for the bundle's version (from `ybm_meta.csv`), and prints why when it cannot. Replay
-does four things:
+Add no flags other than `--accept-missing` (step 1b) and `--release` (step 1). The engine
+runs replay by itself when Docker has a `yugabytedb/yugabyte` image for the bundle's release,
+and prints why when it cannot. Replay does four things:
 
 1. Starts that version in a scratch container.
 2. Injects the customer's row counts and column statistics, the way the TAQO planner tests
@@ -120,8 +135,8 @@ does four things:
 Never `docker pull` without asking: the image is a download of about 1 GB. If the user
 agrees to the pull, run the same command again afterwards.
 
-The engine writes `review.md`, `review.json` and, with replay, `plans.json` into the
-bundle. Exit codes:
+The engine writes `review.md`, `review.json`, `chat.md` (the chat message) and, with replay,
+`plans.json` into the bundle. Exit codes:
 
 - **0:** no findings at high or above.
 - **1:** findings at high or above. This is not a failure.
@@ -193,11 +208,11 @@ an upgraded universe keeps `legacy_mode`). The engine reads these facts from a l
 If replay failed or was skipped, give the reason in one sentence under Validation. Without
 replay, access-path findings stay `probable`. Do not upgrade them by reasoning.
 
-### 4. Summarise
+### 4. Add context
 
-The engine writes the headline (worst finding, its cost, first action). Keep it as it is.
-Replace the `<!-- NOTES ... -->` line with at most two sentences of context that only the
-user gave you, or delete the line. Do not write DDL, numbers or estimates of your own, and do not
+The engine writes the headline (worst finding, its cost, first action) and the chat message.
+Keep both as they are. Replace the `<!-- NOTES ... -->` line with at most two sentences of
+context that only the user gave you, or delete the line. Do not write DDL, numbers or estimates of your own, and do not
 add causes or effects (contention, latency, retries) that no finding states: every
 statement, figure and claim in the review comes from the engine. Add a `## Reviewer notes` section
 only when step 6 produced something or you disagree with a finding.
@@ -206,6 +221,9 @@ The report ends with a **Safety check** table: the engine applied every recommen
 to a copy of the schema and checked uniqueness, ON CONFLICT targets and the plans of every
 ranked pattern. Rows marked `amended` already include the fix (for example an added UNIQUE
 index). Never recommend DDL that bypasses a `warn` row; point the user at the SAF finding.
+Replacement indexes keep the original's UNIQUE, INCLUDE, predicate and SPLIT, and drops are
+plain `DROP INDEX` (YSQL rejects `DROP INDEX CONCURRENTLY`) or `ALTER TABLE ... DROP
+CONSTRAINT` for a constraint's index. Do not rewrite them.
 
 ### 5. Limitations
 
@@ -221,12 +239,36 @@ verified by the engine". Do not merge these into the findings table.
 
 ### 7. Deliver
 
-Give the path to `review.md`. In chat, give only:
+Paste `chat.md` as your chat message, unchanged. It holds the headline, the top three findings
+with their fixes, the review level and, for an incomplete review, the missing inputs and the
+withheld candidates, and it ends with the path to `review.md`. You may add at most two
+sentences after it, under "Reviewer note:", with context the user gave you. Never restate or
+summarise findings in your own words: that is where reviews pick up wrong numbers.
 
-- The headline, copied unchanged.
-- The top three findings by ID, each with its fix, copied from the report.
-- The review level line from the report. If it says INCOMPLETE, also list the missing
-  inputs and the withheld candidates from the Muted checks table.
+## Other skills
+
+Route by what the user hands over and what they ask, not by topic. These skills live in the
+same repository; point to one only if it is installed.
+
+| The user has, and asks | Skill |
+|---|---|
+| A schema dump, with or without statistics and workload: does the model hold up? | this one |
+| A slow query, a plan, or `pg_stat_statements` output without a schema | `yb-query-analysis` |
+| Metrics: a hot node or tablet, CPU, I/O, tablet limits | `yb-metrics-analysis` |
+| "Is the universe healthy?", no single symptom | `yb-performance-assessment` |
+| A new schema, application code or a migration to write | `ysql` |
+
+Hand-offs from a review:
+
+- **Workload hygiene** findings describe how the application uses the database. Following
+  them up on the running system belongs to `yb-query-analysis`.
+- **Writing the migration** for a recommended change (backfill, dual writes, cut-over)
+  belongs to `ysql`.
+- **Reading a replayed plan** node by node belongs to `explain-plan-analyzer`.
+
+When another skill calls this one as part of a broader assessment, hand back `review.md` as
+its own section: its findings are not merged into, re-ranked or re-graded in the caller's
+list, and the preflight question still goes to the user.
 
 ## Style
 

@@ -62,7 +62,7 @@ npx skills add yugabyte/yugabytedb-skills -s yb-model
 |`yb-metrics-analysis`|YugabyteDB universe metrics analysis — Prometheus/PromQL-based triage and playbooks for hotspots, CPU, memory, I/O, latency/throughput, connection skew, and tablet limits|
 |`yb-performance-assessment`|Broad, whole-universe YugabyteDB performance assessment — triage-and-orchestration entry point that runs cross-cutting SQL and infrastructure checks, then dispatches to the specialist skills|
 |`yb-query-analysis`|YSQL query performance, session activity, and lock contention analysis — including proactive database health assessment and pg_stat_statements/ASH-driven diagnosis|
-|`yb-model`|Complete review of an existing YSQL schema and data model — sharding, primary keys, indexes, partitions, tablet splits and data quality checked against the schema dump, `pg_stats`, `pg_stat_statements` and the rest of the evidence by a deterministic rules engine (Python, standard library), with plan replay on the customer's release, a safety pass over its own DDL, and a workload-hygiene section for the application team|
+|`yb-model`|Offline review of an existing YSQL schema and data model from a captured bundle — sharding, primary keys, indexes, partitions, tablet splits and data quality checked against the schema dump, `pg_stats`, `pg_stat_statements` or a query list and the rest of the evidence by a deterministic rules engine (Python, standard library), with plan replay on the customer's release, a safety pass over its own DDL, and a workload-hygiene section for the application team|
 
 ## Learn More
 

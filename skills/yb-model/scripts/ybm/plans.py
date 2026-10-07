@@ -103,7 +103,7 @@ def reconcile(plans, patterns, col, sch, rules, th, recon, wshift, shift, Findin
     # behaviour, not necessarily the customer's.
     caveat = "replayed on %s; differences to %s unknown" % (image, vm.get("customer")) \
         if drift_unknown else None
-    expect_seq = ("CAP001", "CAP002", "CAP003", "CAP040", "CAP021", "CAP031")
+    expect_seq = ("CAP001", "CAP002", "CAP003", "CAP040", "CAP031")
     for key in list(col.items.keys()):
         fnd = col.items[key]
         if not fnd.rule.startswith("CAP") or not fnd.table:
@@ -127,6 +127,10 @@ def reconcile(plans, patterns, col, sch, rules, th, recon, wshift, shift, Findin
                 ok = any(s["node"] == "Index Scan" and s["index"] == fnd.index for s in scans)
                 if not ok and not any(s["index"] == fnd.index for s in scans):
                     ok = None  # planner chose a different path; neither confirmed nor refuted
+            elif fnd.rule == "CAP021":
+                # The partial index the query cannot prove: confirmed while no scan uses it
+                # (whatever path the planner took instead), refuted when the planner uses it.
+                ok = not any(s["index"] == fnd.index for s in scans) if scans else None
             elif fnd.rule == "CAP030":
                 ok = bool(facts["appends"]) and max(facts["appends"]) > 1
             else:
@@ -162,7 +166,8 @@ def reconcile(plans, patterns, col, sch, rules, th, recon, wshift, shift, Findin
             fnd.replay = "planner chose another path: " + "; ".join(
                 "%s: %s" % (pid, _scan_txt(sc)) for pid, _, sc in verdicts)
 
-    # Plan-only findings.
+    # Plan-only findings. Each fires because no static finding predicted the plan, so its fix
+    # says what the planner chose rather than pointing at a finding that does not exist.
     for pid, facts in sorted(by_pat.items(), key=lambda kv: int(kv[0][1:])):
         w = weights.get(pid, "UNRANKED")
         for s in facts["scans"]:
@@ -177,16 +182,20 @@ def reconcile(plans, patterns, col, sch, rules, th, recon, wshift, shift, Findin
                                         pid, s["relation"], rows,
                                         (", storage filter %s" % s["storage_filter"])
                                         if s["storage_filter"] else ""),
-                                    [pid], table=s["table"]))
+                                    [pid], table=s["table"],
+                                    fix=_plan_fix("PLN001", pid, _scans_for(facts, s["table"]),
+                                                  col)))
         if facts["sort_under_limit"] and not any(
                 k[0] in ("CAP010", "CAP011") and pid in v.patterns for k, v in col.items.items()):
             col.add(Finding("PLN002", shift("medium", wshift[w]), label,
-                            "%s sort" % pid, "%s: replayed plan sorts before LIMIT." % pid, [pid]))
+                            "%s sort" % pid, "%s: replayed plan sorts before LIMIT." % pid, [pid],
+                            fix=_plan_fix("PLN002", pid, facts["scans"], col)))
         if facts["appends"] and max(facts["appends"]) > 1 and not any(
                 k[0] == "CAP030" and pid in v.patterns for k, v in col.items.items()):
             col.add(Finding("PLN003", shift("high", wshift[w]), label,
                             "%s append" % pid, "%s: replayed plan appends %d partitions." % (
-                                pid, max(facts["appends"])), [pid]))
+                                pid, max(facts["appends"])), [pid],
+                            fix=_plan_fix("PLN003", pid, facts["scans"], col)))
     # Patterns the release rejected. Untyped parameters are a replay artefact (the application's
     # driver sends typed parameters), not a defect.
     artefacts = []
@@ -232,3 +241,49 @@ def _scan_txt(scans):
         return "no scan of the table"
     return ", ".join("%s%s" % (s["node"], (" using " + s["index"]) if s["index"] else "")
                      for s in scans)
+
+
+# The action of each plan-only finding: what to do about a plan nothing predicted.
+_PLAN_ACTION = {
+    "PLN001": "Check whether an index can serve this pattern's predicates.",
+    "PLN002": "Lead an index with the equality columns and follow with the ORDER BY columns in "
+              "the requested direction.",
+    "PLN003": "Add a predicate on the partition key so the planner can prune.",
+}
+# analyze.run folds these into the Measured line of the finding that shares their pattern and
+# drops them, so a fix that named one would point at a finding the report does not have.
+_FOLDED = ("WRK001", "WRK002")
+_MAX_LISTED = 4   # scans, and other findings, that a fix spells out
+
+
+def _scan_phrase(scans):
+    """_scan_txt for a sentence. A scan the plan repeats (one per partition under an unpruned
+    Append) is said once with a count, and only the first few kinds are spelled out."""
+    kinds = {}
+    for s in scans:
+        k = _scan_txt([s])
+        kinds[k] = kinds.get(k, 0) + 1
+    parts = [k if n == 1 else "%s x%d" % (k, n) for k, n in kinds.items()]
+    more = len(parts) - _MAX_LISTED
+    return ", ".join(parts[:_MAX_LISTED]) + ((" and %d more" % more) if more > 0 else "")
+
+
+def _plan_fix(rule, pid, scans, col):
+    """The fix of a plan-only finding: the action, what the planner did, then which other
+    findings the pattern has. The rules.json text can only say
+    "see X", and X is by construction the finding that does not exist."""
+    used = ("uses " + _scan_phrase(scans)) if scans else "has no scan of a named table"
+    # The action leads: the report's headline quotes a fix's first sentence as "First action".
+    parts = [_PLAN_ACTION[rule], "No static finding predicted this: the replayed plan for %s "
+                                 "%s." % (pid, used)]
+    # Plan-only findings are left out: they are what is being explained, and the PLN001s of
+    # an unpruned partitioned table would each list the others.
+    others = sorted((v.rule, v.obj) for v in col.items.values()
+                    if pid in v.patterns and not v.rule.startswith("PLN")
+                    and v.rule not in _FOLDED)
+    if others:
+        more = len(others) - _MAX_LISTED
+        parts.append("Other findings on %s: %s%s." % (
+            pid, ", ".join("%s (%s)" % o for o in others[:_MAX_LISTED]),
+            (", and %d more" % more) if more > 0 else ""))
+    return " ".join(parts)

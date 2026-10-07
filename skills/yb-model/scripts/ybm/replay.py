@@ -16,6 +16,7 @@ import tempfile
 import time
 
 from . import analyze as an
+from .schema import qi
 
 INJECT_FN = r"""
 CREATE OR REPLACE FUNCTION ybm_inject(rel regclass, col name, p_null real, p_width int,
@@ -77,7 +78,19 @@ def _lit(s):
     return "'" + str(s).replace("'", "''") + "'"
 
 
+def container_cli():
+    """The container CLI: $YBM_CONTAINER_CLI, else docker, else podman (Podman Desktop installs
+    it under /opt/podman/bin, often only aliased as docker in an interactive shell)."""
+    for c in (os.environ.get("YBM_CONTAINER_CLI"), shutil.which("docker"), shutil.which("podman"),
+              "/opt/podman/bin/podman"):
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return "docker"
+
+
 def _sh(cmd, inp=None, timeout=600):
+    if cmd and cmd[0] == "docker":
+        cmd = [container_cli()] + list(cmd[1:])
     return subprocess.run(cmd, input=inp, capture_output=True, text=True, timeout=timeout)
 
 
@@ -92,7 +105,9 @@ def find_image(version, image=None):
         tag = image.split(":")[-1].split("-")[0]
         return image, bool(version) and versions.vt(tag)[:4] == versions.vt(version)[:4]
     r = _sh(["docker", "images", "--format", "{{.Repository}}:{{.Tag}}", "yugabytedb/yugabyte"])
-    tags = sorted((t for t in r.stdout.split() if t and not t.endswith(":<none>")),
+    # Podman names local images docker.io/yugabytedb/yugabyte:<tag>.
+    tags = sorted((re.sub(r"^docker\.io/", "", t) for t in r.stdout.split()
+                   if t and not t.endswith(":<none>")),
                   key=lambda t: versions.vt(t.split(":")[1]))
     if not version:
         return (tags[-1], False) if tags else (None, False)
@@ -150,14 +165,14 @@ def build_inject_sql(bundle, sch):
                      "AND relnamespace = 'public'::regnamespace;" % (float(n), _lit(name)))
     for (t, c), st in sorted(bundle.stats.items()):
         mcf = "ARRAY[%s]::real[]" % ",".join(repr(x) for x in st["mcf"]) if st["mcf"] else "NULL"
+        regclass = _lit("public." + qi(t))  # to_regclass folds unquoted names to lower case
         lines.append(
             "SELECT ybm_inject(to_regclass(%s), %s, %s, %d, %s, %s, %s, %s, %s) "
             "WHERE to_regclass(%s) IS NOT NULL;" % (
-                _lit("public." + t), _lit(c), st["null_frac"] or 0.0, st["avg_width"] or 0,
+                regclass, _lit(c), st["null_frac"] or 0.0, st["avg_width"] or 0,
                 st["n_distinct"] or 0.0, _lit(st["mcv"]) if st["mcv"] else "NULL", mcf,
                 _lit(st["hist"]) if st["hist"] else "NULL",
-                st["correlation"] if st["correlation"] is not None else "NULL",
-                _lit("public." + t)))
+                st["correlation"] if st["correlation"] is not None else "NULL", regclass))
     return "\n".join(lines) + "\n", rel
 
 
@@ -238,14 +253,19 @@ def patterns_sql(patterns, outdir):
 
 
 class Container:
-    def __init__(self, image, name, keep=False):
+    def __init__(self, image, name, keep=False, master_flags=None, tserver_flags=None):
         self.image, self.name, self.keep = image, name, keep
+        self.start = ["bin/yugabyted", "start", "--background=false", "--ui=false"]
+        if master_flags:
+            self.start.append("--master_flags=" + master_flags)
+        if tserver_flags:
+            self.start.append("--tserver_flags=" + tserver_flags)
 
     def __enter__(self):
         _sh(["docker", "rm", "-f", self.name])
         # --pull=never: an image is only ever downloaded after the user agreed to it.
-        r = _sh(["docker", "run", "-d", "--pull=never", "--name", self.name, self.image,
-                 "bin/yugabyted", "start", "--background=false", "--ui=false"])
+        r = _sh(["docker", "run", "-d", "--pull=never", "--name", self.name, self.image] +
+                self.start)
         if r.returncode != 0:
             raise RuntimeError("docker run failed: " + r.stderr.strip())
         for _ in range(100):
@@ -279,10 +299,11 @@ def _errors(text, limit=50):
 
 def run(bundle, image=None, mode="customer", keep=False, max_patterns=200, probe_rules=()):
     ps = an.planner_settings(bundle)
-    from . import schema as schema_mod
-    sch = schema_mod.parse(bundle.ddl, db_colocated=ps["colocated"],
-                           hash_default=ps["hash_default"])
-    patterns = an.build_patterns(bundle, sch)[:max_patterns]
+    sch = an.build_schema(bundle)
+    pats = an.build_patterns(bundle, sch)
+    # The top ranked patterns, and every listed one (unranked, so possibly hot).
+    patterns = pats[:max_patterns] + [p for p in pats[max_patterns:]
+                                      if p["source"] == "queries.sql"]
     from . import versions
     img, exact = find_image(bundle.version, image)
     if not img:

@@ -50,6 +50,13 @@ version:
 When all runs have written `final.md`, give the judge (one strong model) the answer key and
 the `final.md` files, anonymised as A, B, C and so on. The judge writes `scores.json`.
 
+Judge every run on the same deliverable: the review plus the chat message. Runs sometimes put
+only one of the two in `final.md`; before judging, rebuild it from the run's `review.md` and its
+chat message (the skill's `chat.md`, or the run's reply). Alternate which revision is A across
+fixtures so a judge's position bias cannot favour one, and strip run paths that name a revision.
+Where Docker is available, also run each revision's recommended DDL against the fixture's schema
+in a scratch container: the judge cannot tell DDL that YSQL rejects.
+
 For the engine alone, no model is involved:
 
 ```bash

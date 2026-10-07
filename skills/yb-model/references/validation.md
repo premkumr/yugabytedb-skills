@@ -19,7 +19,8 @@ Hand these to the user, or run them yourself with permission, showing each query
 run it.
 
 ```sql
--- A1. Statistics for every column on a table (sampled)
+-- A1. Statistics for every column on a table (sampled). On YSQL, correlation is agreement
+--     with the primary key's order, not insert order.
 SELECT tablename, attname, null_frac, n_distinct, avg_width,
 correlation, most_common_freqs, most_common_vals
 FROM pg_stats WHERE schemaname='public'

@@ -27,6 +27,54 @@ def _conf(f):
     return "; ".join([f["confidence"]] + list(f.get("caveats") or []))
 
 
+def review_level(res):
+    """One line: what kind of review this is, and whether inputs that change it are missing."""
+    level = "structural review (DDL only)"
+    if res["patterns"] and any(p["source"] == "pg_stat_statements" for p in res["patterns"]):
+        level = "workload-weighted review"
+    elif res["patterns"]:
+        level = "query-list review (patterns unranked)"
+    if res.get("replay"):
+        level += " with plan replay on %s" % res["replay"].get("version")
+    major = [m for m in (res.get("preflight") or {}).get("missing", []) if m["tier"] == "major"]
+    if major:
+        level += ", INCOMPLETE: %d major input(s) missing, run with --accept-missing" % len(major)
+    return level
+
+
+def render_chat(res, review_path="review.md"):
+    """The chat message, written by the engine like the rest of the review: the headline, the
+    top three findings with their fixes, the review level and, for an incomplete review, what
+    is missing and which candidates were withheld. The skill pastes it unchanged."""
+    L = [headline(res), ""]
+    top = [f for f in res["findings"] if f.get("section") not in ("hygiene", "disputed")][:3]
+    if top:
+        L.append("Top findings:")
+        for n, f in enumerate(top, 1):
+            L.append("%d. **%s %s** (%s): %s, %s. Fix: %s" % (
+                n, f["id"], f["rule"], f["severity"], f["title"], f["object"],
+                " ".join((f.get("fix") or "see the report").split())))
+        L.append("")
+    L.append("Review level: %s." % review_level(res))
+    pf = res.get("preflight") or {}
+    major = [m for m in pf.get("missing", []) if m["tier"] == "major"]
+    if major:
+        L.append("Missing inputs that change the findings: %s." % "; ".join(
+            m["label"].split(";")[0] for m in major))
+        held = sorted((r, v["withheld"]) for r, v in (pf.get("muted") or {}).items()
+                      if v.get("withheld"))
+        if held:
+            L.append("Withheld candidates (collect the inputs to evaluate them): %s." % "; ".join(
+                "%s: %s" % (r, ", ".join(w[:6]) + (" ..." if len(w) > 6 else ""))
+                for r, w in held))
+    disputed = [f["id"] for f in res["findings"] if f.get("section") == "disputed"]
+    if disputed:
+        L.append("Disputed by replay under assumed planner settings, kept but not recommended: "
+                 "%s." % ", ".join(disputed))
+    L += ["", "Full review: %s" % review_path]
+    return "\n".join(L) + "\n"
+
+
 def headline(res):
     """The review's opening sentences, written by the engine so every model says the same."""
     fs = [f for f in res["findings"] if f.get("section") not in ("hygiene", "disputed")] or \
@@ -71,9 +119,10 @@ def render(res):
     w("## What this review is based on")
     w("")
     w("- Inputs: %s" % (", ".join(res["inputs"]) or "none"))
+    about = (["from " + res["version_source"]] if res.get("version_source") else []) + (
+        ["rules use release data for %s" % ps["release"]] if ps.get("release") else [])
     w("- Version: %s%s" % (res["version"] or "unknown",
-                           (" (rules use release data for %s)" % ps["release"])
-                           if ps.get("release") else ""))
+                           (" (%s)" % "; ".join(about)) if about else ""))
     srcs = ps.get("sources") or {}
     if srcs:
         w("- Settings source: %s" % "; ".join("%s from %s" % (k, v)
@@ -84,16 +133,8 @@ def render(res):
         ps.get("merge_streams") if ps.get("merge_streams") is not None else "unknown",
         {True: "yes", False: "no", None: "unknown"}[ps.get("colocated")]))
     rp = res.get("replay")
-    level = "structural review (DDL only)"
-    if res["patterns"] and any(p["source"] == "pg_stat_statements" for p in res["patterns"]):
-        level = "workload-weighted review"
-    if rp:
-        level += " with plan replay on %s" % rp.get("version")
     pf = res.get("preflight") or {}
-    major = [m for m in pf.get("missing", []) if m["tier"] == "major"]
-    if major:
-        level += ", INCOMPLETE: %d major input(s) missing, run with --accept-missing" % len(major)
-    w("- Review level: %s" % level)
+    w("- Review level: %s" % review_level(res))
     w("- Linter: %s" % ("ran (yb-lint.py)" if res["lint_ran"] else "did not run"))
     w("")
 
@@ -143,7 +184,9 @@ def render(res):
     else:
         w("| ID | Weight | Calls | Time share | Kind | Access path | Query |")
         w("|---|---|---|---|---|---|---|")
-        for p in res["patterns"][:40]:
+        shown = res["patterns"][:40] + [p for p in res["patterns"][40:]
+                                        if p["weight"] == "UNRANKED"]
+        for p in shown:
             acc = "; ".join("%s: %s%s%s" % (
                 a["table"], a["path"] or "scan",
                 " (point)" if a["point"] else "",
@@ -154,9 +197,9 @@ def render(res):
                 p["id"], p["weight"], _fmt(p["calls"]) if p["calls"] is not None else "",
                 ("%.1f%%" % (100 * p["time_share"])) if p["time_share"] is not None else "",
                 p["kind"], _cell(acc, 160), _cell(p["query"], 140)))
-        if len(res["patterns"]) > 40:
+        if len(res["patterns"]) > len(shown):
             w("")
-            w("%d further patterns are in the JSON output." % (len(res["patterns"]) - 40))
+            w("%d further patterns are in the JSON output." % (len(res["patterns"]) - len(shown)))
     w("")
 
     w("## Findings")
@@ -207,8 +250,10 @@ def render(res):
                 w("- **Pinned by:** %s" % "; ".join(
                     "`%s` (\"%s\")" % (t["file"], t["anchor"]) for t in f["test_refs"]))
             elif f.get("basis") == "computed from the bundle":
-                w("- **Basis:** computed from this bundle's statistics and workload; no planner "
-                  "behaviour is involved, so no regress test applies.")
+                ins = f.get("basis_inputs") or ["the bundle"]
+                w("- **Basis:** computed from %s; no planner behaviour is involved, so no "
+                  "regress test applies." % (", ".join(ins[:-1]) + " and " + ins[-1]
+                                             if len(ins) > 1 else ins[0]))
             w("")
         infos = [f for f in fs if f["severity"] == "info" and f["rule"].startswith("LINT-")]
         if infos:

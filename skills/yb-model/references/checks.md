@@ -34,7 +34,11 @@ Then check:
   distributes far better than `(tenant_id) HASH` alone.
 - **Monotonicity.** A monotonic leading *range* key (sequence, timestamp, UUIDv7,
   increasing text ID) sends every insert to the newest tablet. `ASC` also sorts NULLs
-  last, so NULLs collect in the same place.
+  last, so NULLs collect in the same place. Do not read it from `pg_stats.correlation`: YSQL
+  samples rows in primary-key order, so correlation is about 1 for any range key's leading
+  column and says nothing about insert order. Use the column's default (a sequence) or its
+  type and name; write counters say how hot the table is, not whether inserts are ordered.
+  Random IDs spread over the key range do not hot-spot.
 - **Parenthesisation.** `PRIMARY KEY (a, b, c HASH)` is not `PRIMARY KEY ((a, b, c)
   HASH)`.
 - **Prunability.** A composite hash group distributes by the *combination*, so it only
@@ -309,7 +313,10 @@ Tablet counts in examples are illustrative. Derive your own from expected mature
 Most index failures in the field are rollout failures, not design failures.
 
 - **Create the replacement, verify `indisvalid`, then drop the original.** Never reverse
-  it.
+  it. The replacement keeps the original's UNIQUE, INCLUDE, predicate and SPLIT unless the
+  change is meant to remove one. YSQL has no `DROP INDEX CONCURRENTLY` (the parser rejects
+  it): use `DROP INDEX`, and `ALTER TABLE ... DROP CONSTRAINT` for the index behind a UNIQUE
+  constraint. A partitioned parent's index is created without `CONCURRENTLY`.
 - **Clear `idle in transaction` sessions first.** One open transaction stalls `CREATE
   INDEX` and leaves it half-built. Walsenders, auto-analyze, backfill and matview backends
   are excluded from the lagging-backend count and are never the cause.
