@@ -9,7 +9,7 @@ import hashlib
 import re
 
 from .sqltok import (tokenize, split_statements, match_paren, split_top, text_of, expr_of,
-                     is_word, qi, rebase)
+                     is_word, qi, rebase, rel_key, split_key, bare, qn, in_schema_of)
 
 IDENT_MAX = 63  # PostgreSQL truncates longer identifiers silently
 
@@ -57,7 +57,7 @@ def index_sql(orig, name, table=None, keys=None, add_include=(), add_where=None,
                                     if orig.split and orig.split.startswith("INTO") else None)
     return "CREATE %sINDEX %s%s ON %s%s (%s)%s%s%s%s;" % (
         "UNIQUE " if orig.unique else "", "" if partitioned else "CONCURRENTLY ",
-        qi(ident(name)), qi(table or orig.table),
+        qi(ident(bare(name))), qn(table or orig.table),
         (" USING %s" % orig.method) if orig.method not in (None, "lsm") else "",
         keys or orig.signature(quote=True),
         (" INCLUDE (%s)" % ", ".join(qi(c) for c in include)) if include else "",
@@ -71,14 +71,14 @@ def drop_sql(idx, after=None):
     requires it", pinned in yb.port.create_index.out)."""
     if getattr(idx, "constraint", False):
         return "ALTER TABLE %s DROP CONSTRAINT %s;%s" % (
-            qi(idx.table), qi(idx.name), ("  -- after %s is valid" % after) if after else "")
+            qn(idx.table), qi(bare(idx.name)), ("  -- after %s is valid" % after) if after else "")
     return drop_index_sql(idx.name, after)
 
 
 def drop_index_sql(name, after=None):
     """DROP INDEX as YSQL accepts it: the grammar rejects DROP INDEX CONCURRENTLY (gram.y,
     parser_ybc_not_support), so no CONCURRENTLY here."""
-    return "DROP INDEX %s;%s" % (qi(name), ("  -- after %s is valid" % after) if after else "")
+    return "DROP INDEX %s;%s" % (qn(name), ("  -- after %s is valid" % after) if after else "")
 
 
 class KeyCol:
@@ -197,10 +197,29 @@ class Schema:
         self.db_colocated = False
         self.hash_default = True
         self.parse_notes = []
+        self.search_path = ["public"]  # schemas an unqualified name in a query is looked up in
+        self.ambiguous = {}  # unqualified name -> (chosen key, [other keys]) seen in queries
 
     # --- lookups -------------------------------------------------------------
     def table(self, name):
         return self.tables.get(name)
+
+    def rel(self, qual, name):
+        """The key of the table a query names: as qualified, else the first schema on the
+        search path that has it (as the server resolves it), else the one schema that has it.
+        A name that several schemas define is recorded in self.ambiguous."""
+        if qual:
+            return rel_key(qual, name)
+        same = sorted(k for k in self.tables if split_key(k)[1] == name)
+        hit = next((rel_key(s, name) for s in self.search_path
+                    if rel_key(s, name) in self.tables), None)
+        if hit is None and len(same) == 1:
+            hit = same[0]
+        if hit is None:
+            return name
+        if len(same) > 1:
+            self.ambiguous[name] = (hit, [k for k in same if k != hit])
+        return hit
 
     def fks_on_index(self, idx):
         """Foreign keys that may depend on `idx`: a foreign key is created against a unique,
@@ -296,15 +315,16 @@ class Schema:
 # --- parsing ---------------------------------------------------------------------------
 
 def _name(toks, i):
-    """Read a possibly qualified name at toks[i]; return (short_name, next_index)."""
+    """Read a possibly qualified name at toks[i]; return (relation key, next_index): the bare
+    name in schema public, schema.name elsewhere (sqltok.rel_key)."""
     if i >= len(toks) or toks[i].ident is None:
         return None, i
-    name = toks[i].ident
+    parts = [toks[i].ident]
     i += 1
     while i + 1 < len(toks) and toks[i].kind == "." and toks[i + 1].ident is not None:
-        name = toks[i + 1].ident
+        parts.append(toks[i + 1].ident)
         i += 2
-    return name, i
+    return rel_key(parts[-2] if len(parts) > 1 else None, parts[-1]), i
 
 
 def _skip_words(toks, i, *words):
@@ -419,14 +439,14 @@ def _parse_create_table(st, schema, line, sql=None):
             continue
         if is_word(head, "PRIMARY") and len(el) > 2 and el[2].kind == "(":
             j = match_paren(el, 2)
-            t.pk = Index(cons or name + "_pkey", name, _parse_keys(el[3:j]), unique=True,
-                         is_pk=True, line=line)
+            t.pk = Index(in_schema_of(name, cons) if cons else name + "_pkey", name,
+                         _parse_keys(el[3:j]), unique=True, is_pk=True, line=line)
             continue
         nnd, m = _nulls_clause(el, 1) if is_word(head, "UNIQUE") else (False, 1)
         if is_word(head, "UNIQUE") and len(el) > m and el[m].kind == "(":
             j = match_paren(el, m)
-            iname = cons or "%s_%s_key" % (name, "_".join(text_of([x]) for x in el[m + 1:j]
-                                                             if x.ident))
+            iname = in_schema_of(name, cons) if cons else "%s_%s_key" % (
+                name, "_".join(text_of([x]) for x in el[m + 1:j] if x.ident))
             schema.indexes[iname] = Index(iname, name, _parse_keys(el[m + 1:j]), unique=True,
                                           line=line, constraint=True, nulls_not_distinct=nnd)
             continue
@@ -475,7 +495,7 @@ def _parse_create_table(st, schema, line, sql=None):
             ref, rcols, m = _references(el, r)
             fname = el[r - 1].ident if r >= 2 and is_word(el[r - 2], "CONSTRAINT") else None
             schema.foreign_keys.append(ForeignKey(
-                fname or "%s_%s_fkey" % (name, cname), name, [cname], ref, rcols,
+                fname or "%s_%s_fkey" % (bare(name), cname), name, [cname], ref, rcols,
                 "FOREIGN KEY (%s) %s" % (qi(cname), _raw(sql, el[r:m]))))
         if "UNIQUE" in rest:
             iname = "%s_%s_key" % (name, cname)
@@ -581,6 +601,7 @@ def _parse_create_index(st, schema, line, sql=None):
     i += 1
     i = _skip_words(st, i, "ONLY")
     tname, i = _name(st, i)
+    iname = in_schema_of(tname, iname)  # an index lives in its table's schema
     method = "lsm"
     if is_word(st[i], "USING"):
         method = st[i + 1].text.lower()
@@ -658,15 +679,15 @@ def _parse_alter_table(st, schema, line, sql=None):
         e = match_paren(st, j + 2)
         t = schema.tables.get(tname)
         if t:
-            t.pk = Index(cname or tname + "_pkey", tname, _parse_keys(st[j + 3:e]),
-                         unique=True, is_pk=True, line=line)
+            t.pk = Index(in_schema_of(tname, cname) if cname else tname + "_pkey", tname,
+                         _parse_keys(st[j + 3:e]), unique=True, is_pk=True, line=line)
             for kc in t.pk.keys:
                 if kc.col in t.cols:
                     t.cols[kc.col]["notnull"] = True
     elif is_word(st[j], "UNIQUE") and st[_nulls_clause(st, j + 1)[1]].kind == "(":
         nnd, m = _nulls_clause(st, j + 1)
         e = match_paren(st, m)
-        iname = cname or "%s_key" % tname
+        iname = in_schema_of(tname, cname) if cname else "%s_key" % tname
         schema.indexes[iname] = Index(iname, tname, _parse_keys(st[m + 1:e]), unique=True,
                                       line=line, constraint=True, nulls_not_distinct=nnd)
     elif is_word(st[j], "FOREIGN") and is_word(st[j + 1], "KEY") and st[j + 2].kind == "(":
@@ -675,15 +696,16 @@ def _parse_alter_table(st, schema, line, sql=None):
         if e + 1 < len(st) and is_word(st[e + 1], "REFERENCES"):
             ref, rcols, m = _references(st, e + 1)
             schema.foreign_keys.append(ForeignKey(
-                cname or "%s_%s_fkey" % (tname, "_".join(fcols)), tname, fcols, ref, rcols,
+                cname or "%s_%s_fkey" % (bare(tname), "_".join(fcols)), tname, fcols, ref, rcols,
                 _raw(sql, st[j:m])))
     elif is_word(st[j], "UNIQUE") and is_word(st[j + 1], "USING") and is_word(st[j + 2], "INDEX"):
         # How ysql_dump writes a unique constraint (pg_dump.c): the index first, then the
         # constraint over it. The index is renamed to the constraint's name.
         src, _ = _name(st, j + 3)
+        src = in_schema_of(tname, src)
         idx = schema.indexes.pop(src, None)
         if idx is not None:
-            idx.name = cname or src
+            idx.name = in_schema_of(tname, cname) if cname else src
             idx.constraint = True
             schema.indexes[idx.name] = idx
 

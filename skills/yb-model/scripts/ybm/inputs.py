@@ -25,21 +25,58 @@ The release can come from several places; see release_sources().
 
 import csv
 import glob
+import io
 import json
 import math
 import os
 import re
 
+from .sqltok import rel_key
+
 csv.field_size_limit(1 << 30)
+
+
+class InputError(Exception):
+    """A bundle file the engine cannot read. The message names the file and the likely cause,
+    so the file can be converted (a copy of it) and the review run again."""
+
+
+def read_text(path):
+    """A text file as UTF-8 (a byte-order mark, as Excel writes, is dropped). UTF-16 and
+    binary files are refused by name: read as UTF-8 they would turn into empty input."""
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")) or b"\x00" in data[:65536]:
+        raise InputError("%s is UTF-16 or binary, not UTF-8 text (NUL bytes); convert a copy "
+                         "of it to UTF-8" % os.path.basename(path))
+    return data.decode("utf-8-sig", errors="replace")
+
+
+class _Row(dict):
+    """A CSV row whose missing column is an InputError naming the file, not a KeyError."""
+    file = None
+
+    def __missing__(self, key):
+        raise InputError("%s has no %s column: the header row is missing or the file uses "
+                         "another delimiter" % (self.file, key))
 
 
 def _rows(path):
     if path.endswith(".json"):
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
+        data = json.loads(read_text(path))
         return data if isinstance(data, list) else data.get("rows", [])
-    with open(path, newline="", encoding="utf-8", errors="replace") as fh:
-        return list(csv.DictReader(fh))
+    text = read_text(path)
+    head = text.split("\n", 1)[0]
+    if "," not in head and (";" in head or "\t" in head):
+        raise InputError("%s is separated by %s, not commas; convert a copy of it to CSV" % (
+            os.path.basename(path), "semicolons" if ";" in head else "tabs"))
+    name = os.path.basename(path)
+    out = []
+    for r in csv.DictReader(io.StringIO(text, newline="")):
+        row = _Row(r)
+        row.file = name
+        out.append(row)
+    return out
 
 
 def _find(bundle, stem):
@@ -119,6 +156,9 @@ class Bundle:
         self.present = []
         self.declared_complete = False  # queries.sql says no other statement touches the schema
         self.stated_release = None      # the release the user stated (--release)
+        self.captures = []     # node of each capture whose usage counters were read
+        self.duplicate_captures = []  # (node, folder) skipped: that node was already read
+        self.cluster_nodes = None  # nodes in the cluster (ybm_meta.csv nodes), if known
 
     def release_sources(self):
         """[(release, where, text)] for every place that states the release, most trusted
@@ -158,6 +198,12 @@ class Bundle:
             key = (tt, _match(c, cols, _folded(cols)))
             if key != (t, c) and key not in self.stats:
                 self.stats[key] = self.stats.pop((t, c))
+
+    @property
+    def usage_complete(self):
+        """Do the usage counters (pg_stat_statements, pg_stat_user_indexes and _tables) cover
+        every node? Each node counts only the statements that ran through it."""
+        return self.cluster_nodes is not None and len(set(self.captures)) >= self.cluster_nodes
 
     @property
     def version(self):
@@ -219,21 +265,98 @@ def load(path, release=None):
             b.ddl_files = sorted(p for p in glob.glob(os.path.join(path, "*.sql"))
                                  if os.path.basename(p) not in ("queries.sql", "collect.sql"))
     for p in b.ddl_files:
-        with open(p, encoding="utf-8", errors="replace") as fh:
-            b.ddl += fh.read() + "\n"
+        b.ddl += read_text(p) + "\n"
     if os.path.isdir(path):
         q = os.path.join(path, "queries.sql")
         if os.path.isfile(q):
-            with open(q, encoding="utf-8", errors="replace") as fh:
-                b.queries_sql = fh.read()
+            b.queries_sql = read_text(q)
             b.declared_complete = bool(re.search(r"^\s*--\s*ybm:\s*workload-complete\b",
                                                  b.queries_sql, re.M | re.I))
             b.present.append("queries.sql (declared complete)" if b.declared_complete
                              else "queries.sql")
         _load_tables(b, path)
+        _note_capture(b, b, path)
+        # One capture per node, each in its own folder (collect.sql run on every node): usage
+        # counters are added up; catalog-wide files are the same on every node.
+        for sub in sorted(os.listdir(path)):
+            d = os.path.join(path, sub)
+            if os.path.isdir(d) and glob.glob(os.path.join(d, "ybm_*.*")):
+                node = Bundle(d)
+                _load_tables(node, d)
+                label = _capture_label(node, d)
+                if _has_usage(node) and label in b.captures:
+                    b.duplicate_captures.append((label, sub))  # counted once, not twice
+                    continue
+                _merge(b, node)
+                _note_capture(b, node, d)
     if b.ddl_files:
         b.present.insert(0, "schema (%s)" % ", ".join(os.path.basename(p) for p in b.ddl_files))
     return b
+
+
+def _has_usage(cap):
+    return bool(cap.pss or cap.index_usage or cap.table_usage)
+
+
+def _capture_label(cap, path):
+    return cap.meta.get("node") or os.path.basename(os.path.normpath(path))
+
+
+def _note_capture(b, cap, path):
+    """Record the node a capture came from when it has usage counters, and the cluster size."""
+    if _has_usage(cap):
+        b.captures.append(_capture_label(cap, path))
+    n = _f(cap.meta.get("nodes"))
+    if n is not None and n >= 1:
+        b.cluster_nodes = max(b.cluster_nodes or 0, int(n))
+
+
+_TABLE_COUNTERS = ("seq_scan", "seq_tup_read", "idx_scan", "idx_tup_fetch", "n_tup_ins",
+                   "n_tup_upd", "n_tup_del", "n_tup_hot_upd")
+_PSS_SUM = ("calls", "total_ms", "rows", "docdb_read_rpcs", "docdb_write_rpcs",
+            "docdb_rows_scanned", "docdb_rows_returned", "docdb_seeks", "docdb_nexts",
+            "docdb_read_time", "docdb_wait_time", "total_plan_time")
+
+
+def _merge(b, node):
+    """Add one node's capture to the bundle: counters summed, other files taken when the
+    bundle lacks them."""
+    for attr in ("stats", "stats_duplicates", "reltuples", "settings", "tablets"):
+        if not getattr(b, attr) and getattr(node, attr):
+            setattr(b, attr, getattr(node, attr))
+            if attr == "tablets":
+                b.tablets_cluster_wide = node.tablets_cluster_wide
+    for k, v in node.meta.items():
+        b.meta.setdefault(k, v)
+    rows = {(r["queryid"], r["query"]): r for r in b.pss}
+    for r in node.pss:
+        have = rows.get((r["queryid"], r["query"]))
+        if have is None:
+            rows[(r["queryid"], r["query"])] = dict(r)
+            continue
+        for k in _PSS_SUM:
+            if r.get(k) is not None:
+                have[k] = (have.get(k) or 0.0) + r[k]
+        if r.get("max_exec_time") is not None:
+            have["max_exec_time"] = max(have.get("max_exec_time") or 0.0, r["max_exec_time"])
+        have.pop("stddev_exec_time", None)  # cannot be combined from per-node values
+        have["mean_ms"] = have["total_ms"] / have["calls"] if have.get("calls") else 0.0
+    b.pss = list(rows.values())
+    for name, u in node.index_usage.items():
+        have = b.index_usage.setdefault(name, {"table": u["table"], "idx_scan": 0.0})
+        have["idx_scan"] += u["idx_scan"] or 0.0
+    for name, u in node.table_usage.items():
+        have = b.table_usage.setdefault(name, {})
+        for k, v in u.items():
+            if v is None:
+                continue
+            if k in _TABLE_COUNTERS:
+                have[k] = (have.get(k) or 0.0) + v
+            else:  # n_live_tup and other estimates: each node holds its own view, not a share
+                have[k] = max(have.get(k) or 0.0, v)
+    for p in node.present:
+        if p not in b.present:
+            b.present.append(p)
 
 
 def _load_tables(b, path):
@@ -249,7 +372,7 @@ def _load_tables(b, path):
         for r in rows:
             if str(r.get("inherited", "f")).lower() in ("t", "true", "1"):
                 continue
-            key = (r["tablename"], r["attname"])
+            key = (rel_key(r.get("schemaname"), r["tablename"]), r["attname"])
             n_rows[key] = n_rows.get(key, 0) + 1
             nodes = _nodes(r) if by_nodes else 0
             if key in best and nodes <= best[key]:
@@ -288,18 +411,19 @@ def _load_tables(b, path):
     if p:
         b.present.append(os.path.basename(p))
         for r in _rows(p):
-            b.reltuples[r["relname"]] = _f(r.get("reltuples"), -1.0)
+            b.reltuples[rel_key(r.get("schemaname"), r["relname"])] = _f(r.get("reltuples"), -1.0)
     p = _find(path, "ybm_index_usage")
     if p:
         b.present.append(os.path.basename(p))
         for r in _rows(p):
-            b.index_usage[r["indexrelname"]] = {
-                "table": r.get("relname", ""), "idx_scan": _f(r.get("idx_scan"), 0.0)}
+            b.index_usage[rel_key(r.get("schemaname"), r["indexrelname"])] = {
+                "table": rel_key(r.get("schemaname"), r.get("relname", "")),
+                "idx_scan": _f(r.get("idx_scan"), 0.0)}
     p = _find(path, "ybm_table_usage")
     if p:
         b.present.append(os.path.basename(p))
         for r in _rows(p):
-            b.table_usage[r["relname"]] = {k: _f(v) for k, v in r.items()
+            b.table_usage[rel_key(r.get("schemaname"), r["relname"])] = {k: _f(v) for k, v in r.items()
                                                    if k != "relname" and k != "schemaname"}
     p = _find(path, "ybm_settings")
     if p:
@@ -319,7 +443,8 @@ def _load_tables(b, path):
         b.present.append(os.path.basename(p))
         for r in _rows(p):
             if "num_tablets" in r:
-                b.tablets[r["relname"]] = int(_f(r.get("num_tablets"), 0) or 0)
+                b.tablets[rel_key(r.get("schemaname"), r["relname"])] = int(
+                    _f(r.get("num_tablets"), 0) or 0)
             else:  # yb_local_tablets lists only the tablets with a peer on one node
                 b.tablets_cluster_wide = False
                 b.tablets[r["table_name"]] = int(_f(r.get("tablets"), 0) or 0)

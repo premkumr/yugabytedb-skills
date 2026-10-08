@@ -18,7 +18,7 @@ import tempfile
 import time
 
 from . import schema as schema_mod
-from .sqltok import split_statements, tokenize, rebase
+from .sqltok import split_statements, tokenize, rebase, rel_key, in_schema_of
 
 # One JSON document with everything the model needs, from user schemas only.
 QUERY = r"""
@@ -36,6 +36,9 @@ SELECT json_build_object(
       'partkey', CASE WHEN r.relkind = 'p' THEN pg_get_partkeydef(r.oid) END,
       'parent', (SELECT pc.relname FROM pg_inherits i JOIN pg_class pc ON pc.oid = i.inhparent
                   WHERE i.inhrelid = r.oid LIMIT 1),
+      'parent_schema', (SELECT pn.nspname FROM pg_inherits i JOIN pg_class pc
+                         ON pc.oid = i.inhparent JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+                        WHERE i.inhrelid = r.oid LIMIT 1),
       'bound', (SELECT pg_get_expr(c.relpartbound, c.oid) FROM pg_class c WHERE c.oid = r.oid),
       'columns', (SELECT json_agg(json_build_object(
           'name', a.attname, 'type', format_type(a.atttypid, a.atttypmod),
@@ -54,11 +57,16 @@ SELECT json_build_object(
                         AND con.conrelid = i.indrelid LIMIT 1),
       'parent', (SELECT pc.relname FROM pg_inherits h JOIN pg_class pc ON pc.oid = h.inhparent
                   WHERE h.inhrelid = i.indexrelid LIMIT 1),
+      'parent_schema', (SELECT pn.nspname FROM pg_inherits h JOIN pg_class pc
+                         ON pc.oid = h.inhparent JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+                        WHERE h.inhrelid = i.indexrelid LIMIT 1),
       'tablets', (SELECT p.num_tablets FROM yb_table_properties(i.indexrelid) p))
       ORDER BY r.nspname, r.relname)
       FROM rel r JOIN pg_index i ON i.indexrelid = r.oid JOIN pg_class t ON t.oid = i.indrelid),
   'fks', (SELECT json_agg(json_build_object(
       'name', con.conname, 'table', c.relname, 'ref_table', rc.relname,
+      'schema', n.nspname,
+      'ref_schema', (SELECT rn.nspname FROM pg_namespace rn WHERE rn.oid = rc.relnamespace),
       'cols', (SELECT json_agg(a.attname ORDER BY k.ord) FROM unnest(con.conkey)
                  WITH ORDINALITY k(attnum, ord) JOIN pg_attribute a
                  ON a.attrelid = con.conrelid AND a.attnum = k.attnum),
@@ -76,9 +84,12 @@ SELECT json_build_object(
 TSERVER_FLAGS = "ysql_num_shards_per_tserver=1,yb_num_shards_per_tserver=1"
 _ERR_LINE = re.compile(r":(\d+): ERROR:\s*(.*)")
 _SPLIT_INTO = re.compile(r"(?i)\bSPLIT\s+INTO\s+(\d+)\s+TABLETS\b")
-_OBJ = re.compile(r'(?is)^\s*CREATE\s+(?:UNIQUE\s+)?(?:TABLE|INDEX)\s+(?:NONCONCURRENTLY\s+|'
+_OBJ = re.compile(r'(?is)^\s*CREATE\s+(?:UNIQUE\s+)?(TABLE|INDEX)\s+(?:NONCONCURRENTLY\s+|'
                   r'CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?((?:"[^"]+"|[^\s"(.]+)\.)?'
                   r'("[^"]+"|[^\s"(]+)')
+
+
+_ON = re.compile(r'(?is)\bON\s+(?:ONLY\s+)?((?:"[^"]+"|[^\s"(.]+)\.)?("[^"]+"|[^\s"(]+)')
 
 
 def _ident(text):
@@ -86,14 +97,24 @@ def _ident(text):
 
 
 def one_tablet(ddl):
-    """(ddl, {object name: declared tablet count}). Every SPLIT INTO n TABLETS becomes one
-    tablet: a large schema then loads on one node (the server caps tablet replicas per node),
-    and the declared counts are kept for the model. Tablet counts change no catalog fact."""
+    """(ddl, {object: declared tablet count}). Every SPLIT INTO n TABLETS becomes one tablet:
+    a large schema then loads on one node (the server caps tablet replicas per node), and the
+    declared counts are kept for the model. Tablet counts change no catalog fact. A table is
+    keyed as the model keys it (schema.name outside public); an index by its bare name, as
+    CREATE INDEX writes it."""
     declared = {}
     for _, _, text in _statements(ddl):
         m, s = _OBJ.match(text), _SPLIT_INTO.search(text)
         if m and s:
-            declared[_ident(m.group(2))] = int(s.group(1))
+            name = _ident(m.group(3))
+            if m.group(1).upper() == "TABLE":
+                name = rel_key(_ident(m.group(2)[:-1]) if m.group(2) else None, name)
+            else:  # an index lives in its table's schema
+                on = _ON.search(text, m.end())
+                if on:
+                    name = in_schema_of(rel_key(_ident(on.group(1)[:-1]) if on.group(1) else None,
+                                                _ident(on.group(2))), name)
+            declared[name] = int(s.group(1))
     return _SPLIT_INTO.sub("SPLIT INTO 1 TABLETS", ddl), declared
 
 
@@ -199,12 +220,8 @@ def build(cat, explicit=True, failed=(), declared=None, hash_default=True):
     sch = schema_mod.Schema()
     sch.db_colocated = bool(cat.get("db_colocated"))
     sch.hash_default = hash_default
-    seen = {}
     for t in cat.get("tables") or []:
-        name = t["name"]
-        if name in sch.tables:  # the same name in another schema: the model is unqualified
-            seen.setdefault(name, [sch.tables[name].schema]).append(t["schema"])
-            continue
+        name = rel_key(t.get("schema"), t["name"])  # schema.name outside public
         tb = schema_mod.Table(name)
         tb.schema = t["schema"]
         for c in t.get("columns") or []:
@@ -224,7 +241,7 @@ def build(cat, explicit=True, failed=(), declared=None, hash_default=True):
                 tb.partition_by = (m.group(1).upper(), [x.strip().strip('"')
                                                         for x in m.group(2).split(",")])
         if t.get("parent"):
-            tb.partition_of = t["parent"]
+            tb.partition_of = rel_key(t.get("parent_schema"), t["parent"])
             bound = t.get("bound") or ""
             if bound.strip().upper() == "DEFAULT":
                 tb.is_default = True
@@ -244,20 +261,22 @@ def build(cat, explicit=True, failed=(), declared=None, hash_default=True):
         if not st:
             continue
         schema_mod._parse_create_index(st[0], tmp, 0, i["def"])
-        idx = tmp.indexes.get(i["name"])
-        if idx is None or i["table"] not in sch.tables:
+        key, table = rel_key(i.get("schema"), i["name"]), rel_key(i.get("schema"), i["table"])
+        idx = tmp.indexes.get(key)
+        if idx is None or table not in sch.tables:
             continue
-        n = (declared or {}).get(idx.name)
+        n = (declared or {}).get(key)
         if n and n > 1:  # loaded with one tablet; the DDL declared more
             idx.split, idx.split_sql = "INTO %d" % n, "SPLIT INTO %d TABLETS" % n
         elif idx.split == "INTO 1":  # one tablet: the load's setting, not a declared layout
             idx.split = idx.split_sql = None
-        idx.parent = i.get("parent")
+        idx.parent = rel_key(i.get("parent_schema") or i.get("schema"), i["parent"]) \
+            if i.get("parent") else None
         for k in idx.keys:
             k.explicit = explicit
         if i["primary"]:
             idx.is_pk = True
-            sch.tables[i["table"]].pk = idx
+            sch.tables[table].pk = idx
         else:
             idx.constraint = bool(i.get("constraint"))
             sch.indexes[idx.name] = idx
@@ -266,11 +285,9 @@ def build(cat, explicit=True, failed=(), declared=None, hash_default=True):
             t.pk.split = t.split
     for f in cat.get("fks") or []:
         sch.foreign_keys.append(schema_mod.ForeignKey(
-            f["name"], f["table"], f.get("cols") or [], f["ref_table"], f.get("ref_cols"),
+            f["name"], rel_key(f.get("schema"), f["table"]), f.get("cols") or [],
+            rel_key(f.get("ref_schema"), f["ref_table"]), f.get("ref_cols"),
             f.get("def")))
-    for name, schemas in sorted(seen.items()):
-        sch.parse_notes.append("%s exists in schemas %s; the review models the first only" % (
-            name, ", ".join(schemas)))
     if failed:
         text = schema_mod.parse("\n".join(s + ";" for s, _ in failed if s),
                                 db_colocated=sch.db_colocated, hash_default=hash_default)

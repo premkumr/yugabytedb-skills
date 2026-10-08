@@ -4,3 +4,5 @@ database,shop
 colocated,false
 postmaster_start,2026-10-01 00:14:33.95544+00
 captured_at,2026-10-01 00:17:01.648736+00
+node,127.0.0.1:5433
+nodes,1

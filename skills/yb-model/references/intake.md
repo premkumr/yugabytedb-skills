@@ -11,7 +11,14 @@ ysql_dump -h <host> -U <user> -d <db> --schema-only --include-yb-metadata > sche
 ```
 
 That directory is the bundle. It covers Round 1 and Round 3 below, plus the release,
-settings, index usage and tablet counts. Files in other shapes are fine: SKILL.md step 1 says
+settings, index usage and tablet counts.
+
+`pg_stat_statements` and the index and table usage counters count only the statements that
+ran through the node `collect.sql` connects to. One run ranks the workload fairly but cannot
+prove an index unused. For that, run `collect.sql` once on every node, each into its own
+subfolder of the bundle (`node1/`, `node2/`, ...); the engine adds them up and records which
+nodes they cover. `pitfalls.md` lists other input traps (encodings, truncated statements,
+several schemas, recent stats resets). Files in other shapes are fine: SKILL.md step 1 says
 how to convert them. Ask the rounds below only for what the bundle cannot
 contain: SLOs, growth, client retry behaviour and CDC.
 

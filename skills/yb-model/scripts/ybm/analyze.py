@@ -590,11 +590,32 @@ def _rekey_comment(tname, key, colocated, steps="Create the replacement, copy, s
     they are named for moving."""
     return ("-- %s: a primary key cannot be changed in place. %s:\n-- CREATE TABLE %s (... "
             "PRIMARY KEY (%s))%s;%s" % (
-                tname, steps, schema_mod.qi(tname + "_new"), key,
+                tname, steps, schema_mod.qn(tname + "_new"), key,
                 "" if colocated else " SPLIT INTO <n> TABLETS",
                 ("\n-- foreign keys that reference %s (%s) must be dropped before the swap and "
                  "added back after it" % (tname, ", ".join("%s on %s" % (fk.name, fk.table)
                                                           for fk in fks))) if fks else ""))
+
+
+def _usage_complete(bundle):
+    return getattr(bundle, "usage_complete", False)
+
+
+def _usage_scope(bundle):
+    """Which nodes the usage counters cover, in words."""
+    n, total = len(set(getattr(bundle, "captures", []) or [])) or 1, \
+        getattr(bundle, "cluster_nodes", None)
+    if total is None:
+        return "%d node%s of a cluster of unknown size" % (n, "" if n == 1 else "s")
+    return "%d of %d node%s" % (n, total, "" if total == 1 else "s")
+
+
+def _check_then_drop(name, ddl=None):
+    """A DROP INDEX preceded by the read-only check to run on every node first (each node's
+    pg_stat_user_indexes counts only the scans that went through it)."""
+    return ("-- first, on every node: SELECT idx_scan FROM pg_stat_user_indexes WHERE "
+            "indexrelname = '%s';  drop only if 0 on all of them\n%s" % (
+                schema_mod.bare(name), ddl or schema_mod.drop_index_sql(name)))
 
 
 def partition_copies(sch, name):
@@ -615,17 +636,28 @@ def _old_index_note(name):
     (before the swap it removes a live access path, and any foreign key built on it blocks
     it), so it is a note, not DDL."""
     return ("-- %s is not created on the new table; it goes when the old table is dropped "
-            "after the swap" % schema_mod.qi(name))
+            "after the swap" % schema_mod.qn(name))
+
+
+def search_path(bundle):
+    """Schemas an unqualified table name resolves in, from pg_settings search_path (the
+    server default "$user", public without it). "$user" names a schema per login role, which
+    the bundle does not know, so it is skipped."""
+    raw = bundle.settings.get("search_path") or '"$user", public'
+    out = [p.strip().strip('"') for p in raw.split(",")]
+    return [p for p in out if p and p != "$user"] or ["public"]
 
 
 def build_schema(bundle):
     ps = planner_settings(bundle)
     if getattr(bundle, "catalog_schema", None) is not None:  # read from a scratch server
         sch = copy.deepcopy(bundle.catalog_schema)
+        sch.search_path = search_path(bundle)
         bundle.align_names(sch)
         return sch
     sch = schema_mod.parse(bundle.ddl, db_colocated=ps["colocated"],
                            hash_default=ps["hash_default"])
+    sch.search_path = search_path(bundle)
     bundle.align_names(sch)
     return sch
 
@@ -720,6 +752,27 @@ def run(bundle, plans=None, schema_override=None):
 
     dropped, listed = [], {}
     patterns = build_patterns(bundle, sch, dropped, listed)
+    for label, folder in getattr(bundle, "duplicate_captures", []):
+        open_items.append("The capture in %s is from node %s, which another folder already "
+                          "holds; it was not added a second time." % (folder, label))
+    if (bundle.pss or bundle.index_usage or bundle.table_usage) and not _usage_complete(bundle):
+        open_items.append(
+            "Workload and usage counters cover %s: pg_stat_statements and pg_stat_user_indexes "
+            "/ _tables count only the statements that ran through the node they are read on. "
+            "Pattern ranking holds when connections are spread across nodes; an index with no "
+            "scans may still be used through another node, so drops start with a check on "
+            "every node. Running collect.sql once per node, each into its own folder of the "
+            "bundle, removes this." % _usage_scope(bundle))
+    for name, (hit, others) in sorted(sch.ambiguous.items()):
+        open_items.append(
+            "Queries name %s without a schema, and %s define it: they were read as %s, the "
+            "first on the search path (%s)%s. If the application sets search_path per "
+            "connection (one schema per tenant, for example), the same statements may run "
+            "against %s too." % (
+                name, ", ".join([hit] + others), hit, ", ".join(sch.search_path),
+                "" if bundle.settings.get("search_path") else
+                ", the server default; pg_settings did not include search_path",
+                ", ".join(others)))
     if bundle.pss and listed:
         add = listed["added"]
         n = listed["matched"] + len(add)
@@ -888,9 +941,11 @@ def run(bundle, plans=None, schema_override=None):
                         else:
                             c1fix = "Index the bound columns as the hash group: (%s)." % newkey
                             c1ddl = "CREATE INDEX CONCURRENTLY %s ON %s (%s);" % (
-                                schema_mod.qi(schema_mod.ident("%s_%s" % (table, "_".join(
-                                    re.sub(r"\W+", "_", k.label).strip("_") for k in bound)))),
-                                schema_mod.qi(table), newkey)
+                                schema_mod.qi(schema_mod.ident("%s_%s" % (
+                                    schema_mod.bare(table), "_".join(
+                                        re.sub(r"\W+", "_", k.label).strip("_")
+                                        for k in bound)))),
+                                schema_mod.qn(table), newkey)
                         col.add(Finding("CAP001", shift("high", sev_shift), "probable",
                                         "%s on %s" % (i.name, table),
                                         "%s filters %s but does not bind %s of %s's hash group "
@@ -941,9 +996,9 @@ def run(bundle, plans=None, schema_override=None):
                             inc = [c for c in proj if c in t.cols]
                             cddl = "CREATE %sINDEX CONCURRENTLY %s ON %s (%s)%s;" % (
                                 "UNIQUE " if uniq else "", schema_mod.qi(schema_mod.ident(
-                                    "%s_%s" % (table, re.sub(r"[^a-z0-9]+", "_",
-                                                             e.lower()).strip("_")))),
-                                schema_mod.qi(table),
+                                    "%s_%s" % (schema_mod.bare(table), re.sub(
+                                        r"[^a-z0-9]+", "_", e.lower()).strip("_")))),
+                                schema_mod.qn(table),
                                 ("(%s) ASC" if sch.is_colocated(table) else "(%s) HASH") % e,
                                 (" INCLUDE (%s)" % ", ".join(schema_mod.qi(c) for c in inc))
                                 if inc else "")
@@ -1259,14 +1314,22 @@ def run(bundle, plans=None, schema_override=None):
         for i in secondary:
             u = bundle.index_usage.get(i.name)
             if u is not None and u["idx_scan"] == 0 and not i.unique:
-                col.add(Finding("WRK003", "medium" if ww else "low", "confirmed", i.name,
-                                "%s on %s has idx_scan = 0 since stats reset%s." % (
+                every = _usage_complete(bundle)
+                col.add(Finding("WRK003", "medium" if ww else "low",
+                                "confirmed" if every else "probable", i.name,
+                                "%s on %s has idx_scan = 0 since stats reset%s%s." % (
                                     i.name, tname,
                                     (" (postmaster start %s)" % bundle.meta["postmaster_start"])
-                                    if bundle.meta.get("postmaster_start") else ""),
+                                    if bundle.meta.get("postmaster_start") else "",
+                                    "" if every else " on %s" % _usage_scope(bundle)),
                                 table=tname, index=i.name,
-                                fix="Confirm no batch or periodic job needs it, then drop it.",
-                                ddl=schema_mod.drop_index_sql(i.name)))
+                                fix="Confirm no batch or periodic job needs it, then drop it." if
+                                every else "pg_stat_user_indexes counts only the scans that ran "
+                                "through the node it is read on: check idx_scan on every node, "
+                                "and confirm no batch or periodic job needs it, before dropping "
+                                "it.",
+                                ddl=schema_mod.drop_index_sql(i.name) if every else
+                                _check_then_drop(i.name)))
             elif (bundle.pss or bundle.declared_complete) and i.name not in chosen_by and \
                     not i.unique and \
                     not (u is not None and u["idx_scan"] > 0) and \
@@ -1529,8 +1592,9 @@ def run(bundle, plans=None, schema_override=None):
                                            "Create, copy, swap", sch.fks_referencing(tname)) +
                             "\nCREATE UNIQUE INDEX CONCURRENTLY %s ON %s (%s);  -- after the "
                             "swap: the old key stays unique\n%s" % (
-                                schema_mod.qi(schema_mod.ident(tname + "_old_pk")),
-                                schema_mod.qi(tname), schema_mod.key_group(
+                                schema_mod.qi(schema_mod.ident(schema_mod.bare(tname) +
+                                                               "_old_pk")),
+                                schema_mod.qn(tname), schema_mod.key_group(
                                     [k.sql for k in t.pk.keys], sch.is_colocated(tname), None),
                                 _old_index_note(idx.name))))
 
@@ -1842,15 +1906,13 @@ def run(bundle, plans=None, schema_override=None):
         u = bundle.index_usage.get(f.index)
         if any((bundle.index_usage.get(n) or {}).get("idx_scan", 0) > 0 for n in names):
             continue
-        measured = u is not None
-        f.ddl = (schema_mod.drop_index_sql(f.index) if measured else
-                 "-- first: SELECT idx_scan FROM pg_stat_user_indexes WHERE indexrelname = "
-                 "'%s';  drop only if 0\n%s" % (f.index, schema_mod.drop_index_sql(f.index)))
+        measured = u is not None and _usage_complete(bundle)
+        f.ddl = (schema_mod.drop_index_sql(f.index) if measured else _check_then_drop(f.index))
         dropped[f.index] = f.rule
         f.fix = ("No ranked pattern uses %s%s, so drop it rather than rebuild it. Rebuild "
                  "only if a reader outside the captured workload needs it: %s" % (
-                     f.index, " and idx_scan is 0" if measured else
-                     " (idx_scan not captured: check it first)", f.fix or ""))
+                     f.index, " and idx_scan is 0 on every node" if measured else
+                     " (idx_scan not captured on every node: check it first)", f.fix or ""))
     # A finding that drops an index outright settles every other finding on that index: their
     # rebuilds would recreate what is being dropped. Every bare DROP starts with an idx_scan check
     # unless pg_stat_user_indexes showed 0 scans.
@@ -1866,9 +1928,9 @@ def run(bundle, plans=None, schema_override=None):
             f.fix = "Dropping %s (see the %s finding) resolves this too." % (f.index, d.rule)
     for iname, f in sorted(drops.items()):
         u = bundle.index_usage.get(iname)
-        if (u is None or u["idx_scan"] > 0) and "idx_scan" not in f.ddl:
-            f.ddl = ("-- first: SELECT idx_scan FROM pg_stat_user_indexes WHERE indexrelname = "
-                     "'%s';  drop only if 0\n" % iname) + f.ddl
+        if (u is None or u["idx_scan"] > 0 or not _usage_complete(bundle)) and \
+                "idx_scan" not in f.ddl:
+            f.ddl = _check_then_drop(iname, f.ddl)
     from . import safety as safety_mod
     import sys as _sys
     safety_report = safety_mod.check(sch, patterns, col, _sys.modules[__name__], ps, bundle,
@@ -1973,7 +2035,7 @@ def _pure_drop(ddl, index):
     return bool(lines) and index in ddl and all(
         re.match(r"(?i)DROP\s+INDEX\b", l) or re.match(r"(?i)ALTER\s+TABLE\s+.*\bDROP\s+"
                                                         r"CONSTRAINT\b", l) or
-        l.startswith("-- first: SELECT idx_scan") for l in lines)
+        l.startswith("-- first") and "idx_scan" in l for l in lines)
 
 
 # What each rule family reads, for its "Basis" line; a rule in rules.json may say "uses".
@@ -2030,10 +2092,10 @@ def _conflict_fix(sch, bundle, table, cols, target, uniq):
         return (not t.cols.get(c, {}).get("notnull", False), -(nd or 0), cols.index(c))
     order = sorted(cols, key=score)
     nullable = [c for c in cols if not t.cols.get(c, {}).get("notnull", False)]
-    name = schema_mod.ident("%s_%s_uniq" % (table, "_".join(cols)))
+    name = schema_mod.ident("%s_%s_uniq" % (schema_mod.bare(table), "_".join(cols)))
     coloc = sch.is_colocated(table)
     ddl = "CREATE UNIQUE INDEX CONCURRENTLY %s ON %s (%s);" % (
-        schema_mod.qi(name), schema_mod.qi(table),
+        schema_mod.qi(name), schema_mod.qn(table),
         schema_mod.key_group([schema_mod.qi(c) for c in order], coloc))
     fix = ("Create a unique index on exactly (%s)%s, or change the target to the columns of an "
            "existing unique index." % (

@@ -206,6 +206,37 @@ def qi(name):
     return '"%s"' % name.replace('"', '""')
 
 
+def rel_key(qual, name):
+    """The engine's name for a relation: bare in schema public (or when unqualified), and
+    schema.name in any other schema, so same-named tables in two schemas stay apart."""
+    return name if not qual or qual == "public" else "%s.%s" % (qual, name)
+
+
+def split_key(key):
+    """(schema or None, bare name) of a relation key."""
+    if key and "." in key:
+        s, n = key.split(".", 1)
+        return s, n
+    return None, key
+
+
+def bare(key):
+    return split_key(key)[1]
+
+
+def qn(key):
+    """A relation key as SQL: schema-qualified outside public, each part quoted as needed."""
+    s, n = split_key(key)
+    return (qi(s) + "." if s else "") + qi(n)
+
+
+def in_schema_of(table_key, name):
+    """An index or constraint name as a key in its table's schema (they live there)."""
+    if not name or "." in name:
+        return name
+    return rel_key(split_key(table_key)[0], name)
+
+
 def expr_of(toks):
     """Normalised text of an expression that is also valid SQL: as text_of, except that a
     quoted name keeps its quotes where it needs them (mixed case, a reserved word), so "Email"

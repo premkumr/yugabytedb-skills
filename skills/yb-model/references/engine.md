@@ -250,6 +250,13 @@ touches these tables) re-enables IDX001, the coverage-based unused-index check, 
 `workload declared complete`. Duplicate and prefix-redundant indexes (linter YB052 / YB051) are
 structural and run with or without a workload.
 
+Usage counters are per node: `pg_stat_statements` and `pg_stat_user_indexes` / `_tables`
+count only what ran through the node they are read on. Captures from several nodes, one
+folder each, are added up (a node captured twice counts once; row estimates are not added).
+Until every node is in (`collect.sql` records the node and the cluster size), an index with
+no scans is not proven unused: WRK003 is probable, every drop starts with a check on every
+node, and an open item says which nodes the counters cover.
+
 Names in the bundle files are matched to the schema exactly, as the catalog spells them (a
 quoted name keeps its case, so `"Orders"` keeps its statistics). A name that differs from the
 schema's only in case, as in a hand-made file, is matched to the one schema name it equals.
@@ -279,6 +286,8 @@ the same in both modes.
 - Nothing connects to a customer cluster.
 
 ## 10. What the engine does not do
+
+`pitfalls.md` lists the traps reviewers have met in practice and what to do about each.
 
 - Measure latency or tablet sizes on the live cluster.
 - Judge client retry behaviour, CDC, retention, or erasure.

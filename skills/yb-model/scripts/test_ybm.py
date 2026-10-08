@@ -349,6 +349,226 @@ class CatalogSchema(unittest.TestCase):
                                  "CREATE SEQUENCE IF NOT EXISTS public.l_id_seq;"])
 
 
+class UnreadableInputs(Case):
+    """A file the engine cannot read stops the review with its name and the likely cause (exit
+    2), never an empty review; an Excel byte-order mark is simply read."""
+
+    DDL = "CREATE TABLE t (id bigint NOT NULL, PRIMARY KEY ((id) HASH));\n"
+
+    def write(self, files, binary=()):
+        d = self.tmpdir(files)
+        for name, data in binary:
+            with open(os.path.join(d, name), "wb") as fh:
+                fh.write(data)
+        return d
+
+    def test_a_byte_order_mark_is_read(self):
+        d = self.write({"schema.sql": self.DDL}, [(
+            "ybm_settings.csv", "\ufeffname,setting\nyb_enable_cbo,on\n".encode("utf-8"))])
+        self.assertEqual(inputs.load(d).settings, {"yb_enable_cbo": "on"})
+
+    def test_unreadable_files_are_named(self):
+        for label, files, binary, say in (
+                ("utf-16 schema", {}, [("schema.sql", self.DDL.encode("utf-16"))], "UTF-16"),
+                ("semicolons", {"schema.sql": self.DDL,
+                                "ybm_settings.csv": "name;setting\nwork_mem;4MB\n"}, [],
+                 "semicolons"),
+                ("no header", {"schema.sql": self.DDL,
+                               "ybm_settings.csv": "work_mem,4MB\nyb_enable_cbo,on\n"}, [],
+                 "has no name column")):
+            with self.subTest(label):
+                with self.assertRaises(inputs.InputError) as e:
+                    inputs.load(self.write(files, binary))
+                self.assertIn(say, str(e.exception))
+
+    def test_the_cli_stops_with_the_cause(self):
+        d = self.write({}, [("schema.sql", self.DDL.encode("utf-16"))])
+        r = cli("analyze", d)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("schema.sql is UTF-16", r.stderr)
+        r = cli("fixpoint", d)
+        self.assertEqual((r.returncode, "schema.sql is UTF-16" in r.stderr), (2, True))
+        r = cli("analyze", self.write({"schema.sql": "-- nothing here\nSELECT 1;\n"}))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("no table could be read from schema.sql", r.stderr)
+
+
+class NodeCoverage(Case):
+    """pg_stat_statements and pg_stat_user_indexes count only what ran through the node they
+    are read on. A capture per node is added up; until every node is in, an index with no
+    scans is not proven unused and its drop starts with a check on every node."""
+
+    DDL = ("CREATE TABLE t (id bigint NOT NULL, a int, PRIMARY KEY ((id) HASH));\n"
+           "CREATE INDEX t_a ON t (a HASH);\n")
+    USAGE = "schemaname,relname,indexrelname,idx_scan\npublic,t,t_a,%d\n"
+    PSS = PSS_HEAD + "1,%d,%d,1,%d,SELECT * FROM t WHERE id = $1\n"
+
+    def nodes(self, *captures, nodes=None):
+        """A bundle with one folder per node: captures are (idx_scan, calls)."""
+        d = self.tmpdir({"schema.sql": self.DDL})
+        for n, (scans, calls) in enumerate(captures, 1):
+            sub = os.path.join(d, "node%d" % n)
+            os.makedirs(sub)
+            for name, text in (("ybm_index_usage.csv", self.USAGE % scans),
+                               ("ybm_pss.csv", self.PSS % (calls, calls, calls)),
+                               ("ybm_meta.csv", "key,value\nnode,10.0.0.%d:5433\n%s" % (
+                                   n, "nodes,%d\n" % nodes if nodes else ""))):
+                with open(os.path.join(sub, name), "w") as fh:
+                    fh.write(text)
+        return inputs.load(d)
+
+    def test_one_node_of_unknown_many_is_not_proof(self):
+        res = self.review(ddl=self.DDL, files={"ybm_index_usage.csv": self.USAGE % 0})
+        f = self.only(res, "WRK003")
+        self.assertEqual(f["confidence"].split()[0].rstrip(";,"), "probable")
+        self.assertIn("on every node", f["ddl"])
+        self.assertIn("cluster of unknown size", f["fact"])
+        self.assertTrue(any(o.startswith("Workload and usage counters cover") for o in
+                            res["open_items"]))
+
+    def test_every_node_captured_confirms(self):
+        b = self.nodes((0, 10), (0, 20), nodes=2)
+        self.assertTrue(b.usage_complete)
+        self.assertEqual((b.index_usage["t_a"]["idx_scan"], b.pss[0]["calls"]), (0, 30))
+        res = analyze.run(b)
+        f = self.only(res, "WRK003")
+        self.assertTrue(f["confidence"].startswith("confirmed"))
+        # One finding carries the drop (others on t_a defer to it); no check is needed.
+        self.assertEqual([x["ddl"] for x in res["findings"] if x.get("ddl")], ["DROP INDEX t_a;"])
+        self.assertFalse(any(o.startswith("Workload and usage counters cover") for o in
+                             res["open_items"]))
+
+    def test_scans_on_another_node_keep_the_index(self):
+        b = self.nodes((0, 10), (7, 20), nodes=2)
+        self.assertEqual(b.index_usage["t_a"]["idx_scan"], 7)
+        self.assertNotIn("WRK003", self.rules(analyze.run(b)))
+
+    def test_a_node_captured_twice_counts_once(self):
+        b = self.nodes((0, 10), (0, 20), nodes=2)
+        d = os.path.dirname(b.ddl_files[0])
+        shutil.copytree(os.path.join(d, "node1"), os.path.join(d, "node1-copy"))
+        b = inputs.load(d)
+        self.assertEqual(b.pss[0]["calls"], 30)
+        self.assertEqual(b.duplicate_captures, [("10.0.0.1:5433", "node1-copy")])
+        self.assertTrue(any("node1-copy" in o for o in analyze.run(b)["open_items"]))
+
+    def test_row_estimates_are_not_added_up(self):
+        b = self.nodes((0, 10), (0, 20), nodes=2)
+        d = os.path.dirname(b.ddl_files[0])
+        for n, (ins, live) in ((1, (5, 1000)), (2, (7, 40))):
+            with open(os.path.join(d, "node%d" % n, "ybm_table_usage.csv"), "w") as fh:
+                fh.write("schemaname,relname,n_tup_ins,n_live_tup\npublic,t,%d,%d\n" % (ins, live))
+        u = inputs.load(d).table_usage["t"]
+        self.assertEqual((u["n_tup_ins"], u["n_live_tup"]), (12, 1000))
+
+    def test_fewer_captures_than_nodes(self):
+        b = self.nodes((0, 10), nodes=3)
+        self.assertFalse(b.usage_complete)
+        f = self.only(analyze.run(b), "WRK003")
+        self.assertIn("1 of 3 nodes", f["fact"])
+
+
+class Schemas(Case):
+    """Tables outside schema public are known as schema.name, so same-named tables in two
+    schemas stay apart, DDL names the schema, and an unqualified name in a query resolves
+    through search_path as the server resolves it."""
+
+    DDL = ("CREATE TABLE public.orders (id bigint NOT NULL, customer_id bigint, "
+           "PRIMARY KEY ((id) HASH));\n"
+           "CREATE INDEX orders_customer ON public.orders USING lsm (customer_id HASH);\n"
+           "CREATE TABLE archive.orders (id bigint NOT NULL, legacy_ref text, "
+           "CONSTRAINT orders_pkey PRIMARY KEY ((id) HASH));\n"
+           "CREATE INDEX orders_customer ON archive.orders USING lsm (legacy_ref HASH);\n"
+           "ALTER TABLE ONLY archive.orders ADD CONSTRAINT orders_ref UNIQUE (legacy_ref);\n")
+
+    def test_same_names_in_two_schemas_stay_apart(self):
+        sch = schema.parse(self.DDL)
+        self.assertEqual(sorted(sch.tables), ["archive.orders", "orders"])
+        self.assertEqual(sorted(sch.indexes),
+                         ["archive.orders_customer", "archive.orders_ref", "orders_customer"])
+        self.assertEqual(sch.tables["archive.orders"].col_order, ["id", "legacy_ref"])
+        self.assertEqual(sch.tables["archive.orders"].pk.name, "archive.orders_pkey")
+        self.assertEqual(sch.tables["orders"].pk.name, "orders_pkey")
+
+    def test_ddl_names_the_schema_and_reads_back(self):
+        sch = schema.parse(self.DDL)
+        idx = sch.indexes["archive.orders_customer"]
+        self.assertEqual(schema.drop_sql(idx), "DROP INDEX archive.orders_customer;")
+        self.assertTrue(schema.index_sql(idx, idx.name + "_v2").startswith(
+            "CREATE INDEX CONCURRENTLY orders_customer_v2 ON archive.orders "))
+        self.assertTrue(schema.drop_sql(sch.indexes["archive.orders_ref"]).startswith(
+            "ALTER TABLE archive.orders DROP CONSTRAINT orders_ref;"))
+        self.assertEqual(safety.changes_of("DROP INDEX archive.orders_customer;\n"
+                                           "ALTER TABLE archive.orders DROP CONSTRAINT orders_ref;"),
+                         [("drop", "archive.orders_customer"), ("drop", "archive.orders_ref")])
+        self.assertEqual(safety.changes_of(
+            "-- CREATE TABLE archive.orders_new (... PRIMARY KEY ((legacy_ref) HASH));"),
+            [("rekey", "archive.orders", "(legacy_ref) HASH")])
+
+    def test_queries_resolve_through_the_search_path(self):
+        q = ("SELECT * FROM orders WHERE customer_id = $1;\n"
+             "SELECT * FROM archive.orders WHERE legacy_ref = $1;\n")
+        res = self.review(ddl=self.DDL, queries=q)
+        self.assertEqual([p["tables"] for p in res["patterns"]], [["orders"], ["archive.orders"]])
+        item = [o for o in res["open_items"] if o.startswith("Queries name orders")]
+        self.assertTrue(item and "archive.orders" in item[0], res["open_items"])
+        res = self.review(ddl=self.DDL, queries=q, files={
+            "ybm_settings.csv": "name,setting\nsearch_path,\"archive, public\"\n"})
+        self.assertEqual(res["patterns"][0]["tables"], ["archive.orders"])
+
+    def test_replayed_plans_name_relations_as_the_model_does(self):
+        sch = schema.parse(self.DDL)
+        scan = {"Node Type": "Index Scan", "Relation Name": "orders",
+                "Index Name": "orders_customer"}
+        for extra, table in (({"Schema": "archive"}, "archive.orders"), ({}, "orders")):
+            with self.subTest(table):
+                facts = plans.summarize([{"Plan": dict(scan, **extra)}], sch)
+                self.assertEqual((facts["scans"][0]["table"], facts["scans"][0]["index"]),
+                                 (table, schema.in_schema_of(table, "orders_customer")))
+
+    def test_replay_resolves_names_on_the_same_search_path(self):
+        b = self.bundle(ddl=self.DDL, files={
+            "ybm_settings.csv": "name,setting\nsearch_path,\"archive, public\"\n"})
+        sql, _ = replay.settings_sql(b, "customer", None, {}, {})
+        self.assertIn("SET search_path = archive, public;", sql)
+
+    def test_catalog_keys_partition_parents_and_splits_by_schema(self):
+        ddl, declared = catalog.one_tablet(
+            "CREATE INDEX NONCONCURRENTLY orders_customer ON archive.orders USING lsm "
+            "(legacy_ref HASH) SPLIT INTO 6 TABLETS;\n"
+            "CREATE INDEX NONCONCURRENTLY orders_customer ON public.orders USING lsm "
+            "(customer_id HASH) SPLIT INTO 2 TABLETS;\n")
+        self.assertEqual(declared, {"archive.orders_customer": 6, "orders_customer": 2})
+        cols = [{"name": "ts", "type": "date", "notnull": True, "identity": False,
+                 "default": None}]
+        sch = catalog.build({"fks": [], "tables": [
+            {"name": "ev", "schema": "public", "kind": "p", "partkey": "RANGE (ts)",
+             "columns": cols, "props": {}},
+            {"name": "ev_q1", "schema": "parts", "kind": "r", "parent": "ev",
+             "parent_schema": "public", "columns": cols, "props": {"is_colocated": False}}],
+            "indexes": [
+                {"name": "ev_ts", "schema": "public", "table": "ev", "primary": False,
+                 "unique": False, "def": "CREATE INDEX ev_ts ON ONLY public.ev USING lsm (ts ASC)"},
+                {"name": "ev_q1_ts_idx", "schema": "parts", "table": "ev_q1", "primary": False,
+                 "unique": False, "parent": "ev_ts", "parent_schema": "public",
+                 "def": "CREATE INDEX ev_q1_ts_idx ON parts.ev_q1 USING lsm (ts ASC)"}]})
+        self.assertEqual(sch.tables["parts.ev_q1"].partition_of, "ev")
+        self.assertEqual(sch.indexes["parts.ev_q1_ts_idx"].parent, "ev_ts")
+        self.assertEqual(analyze.partition_copies(sch, "ev_ts"), ["parts.ev_q1_ts_idx"])
+
+    def test_statistics_follow_their_schema(self):
+        b = self.bundle(ddl=self.DDL, files={"ybm_pg_stats.csv": stats_csv([]) +
+                                             "archive,orders,legacy_ref,f,0.9,8,10,,,,0\n"
+                                             "public,orders,customer_id,f,0.1,8,10,,,,0\n",
+                                             "ybm_reltuples.csv": "schemaname,relname,relkind,"
+                                             "reltuples\narchive,orders,r,1000\npublic,orders,r,9\n"})
+        sch = analyze.build_schema(b)
+        self.assertEqual(sorted(b.stats), [("archive.orders", "legacy_ref"),
+                                           ("orders", "customer_id")])
+        self.assertEqual(b.reltuples, {"archive.orders": 1000.0, "orders": 9.0})
+        self.assertIn("archive.orders", sch.tables)
+
+
 class PartitionIndexCopies(Case):
     """An index on a partition that the server made as a copy of a partitioned index cannot
     be dropped on its own (YSQL: "cannot drop index ... because index ... requires it"): a

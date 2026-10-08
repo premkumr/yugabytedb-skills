@@ -4,7 +4,7 @@ classify is recorded as 'other' rather than guessed.
 """
 
 from .sqltok import (tokenize, split_statements, match_paren, split_top, text_of, expr_of,
-                     is_word, rebase)
+                     is_word, rebase, rel_key)
 
 CLAUSES = ("SELECT", "FROM", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "FETCH",
            "FOR", "UNION", "INTERSECT", "EXCEPT", "RETURNING", "SET", "VALUES", "USING",
@@ -104,6 +104,12 @@ class _Ctx:
         self.shape = shape
         self.ctes = ctes
         self.alias = {}   # alias -> table (None for CTE/subquery)
+
+    def rel(self, qual, name):
+        """The table key a query's (qualifier, name) refers to."""
+        if self.schema is not None and hasattr(self.schema, "rel"):
+            return self.schema.rel(qual, name)
+        return rel_key(qual, name)
 
     def table_cols(self, table):
         t = self.schema.tables.get(table) if self.schema else None
@@ -417,13 +423,12 @@ def _parse_from(ctx, toks):
             continue
         if it[0].ident is None:
             continue
-        name, ptr = it[0].ident, 1
-        while ptr + 1 < len(it) and it[ptr].kind == "." and it[ptr + 1].ident:
-            name = it[ptr + 1].ident
-            ptr += 2
+        qual, name, ptr = _qualparts(it, 0)
         if ptr < len(it) and it[ptr].kind == "(":
             continue  # set-returning function
         alias = name
+        if name not in ctx.ctes or qual:
+            name = ctx.rel(qual, name)
         if ptr < len(it) and is_word(it[ptr], "AS"):
             ptr += 1
         if ptr < len(it) and it[ptr].ident and it[ptr].kind in ("word", "qident") and \
@@ -520,8 +525,7 @@ def _analyze_tokens(st, schema, ctes=None):
     elif kind == "update":
         k = 1
         k = _skip_words(st, k, "ONLY")
-        name, k = _qualname(st, k)
-        alias = name
+        name, alias, k = _qualname(st, k, ctx)
         if k < len(st) and is_word(st[k], "AS"):
             k += 1
         if k < len(st) and st[k].kind in ("word", "qident") and not is_word(st[k], "SET"):
@@ -538,8 +542,7 @@ def _analyze_tokens(st, schema, ctes=None):
         if is_word(st[k], "FROM"):
             k += 1
         k = _skip_words(st, k, "ONLY")
-        name, k = _qualname(st, k)
-        alias = name
+        name, alias, k = _qualname(st, k, ctx)
         if k < len(st) and is_word(st[k], "AS"):
             k += 1
         if k < len(st) and st[k].kind in ("word", "qident") and not is_word(st[k], "WHERE",
@@ -553,9 +556,9 @@ def _analyze_tokens(st, schema, ctes=None):
         k = 1
         if is_word(st[k], "INTO"):
             k += 1
-        name, k = _qualname(st, k)
-        ctx.alias[name] = name
-        shape.refs.append((name, name))
+        name, alias, k = _qualname(st, k, ctx)
+        ctx.alias[alias] = name
+        shape.refs.append((alias, name))
         for k2, t in enumerate(st):
             if t.depth != 0 or not is_word(t, "CONFLICT") or k2 + 1 >= len(st):
                 continue
@@ -604,13 +607,20 @@ def _skip_words(st, k, *words):
     return k
 
 
-def _qualname(st, k):
-    name = st[k].ident
+def _qualparts(st, k):
+    """(qualifier or None, name, next index) of a possibly qualified name at st[k]."""
+    parts = [st[k].ident]
     k += 1
     while k + 1 < len(st) and st[k].kind == "." and st[k + 1].ident:
-        name = st[k + 1].ident
+        parts.append(st[k + 1].ident)
         k += 2
-    return name, k
+    return (parts[-2] if len(parts) > 1 else None), parts[-1], k
+
+
+def _qualname(st, k, ctx=None):
+    """(table key, bare name, next index): the key the schema knows the table by."""
+    qual, name, k = _qualparts(st, k)
+    return (ctx.rel(qual, name) if ctx is not None else rel_key(qual, name)), name, k
 
 
 def _projection(ctx, sel):

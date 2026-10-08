@@ -148,7 +148,12 @@ def main():
 
     if args.cmd == "fixpoint":
         from ybm import fixpoint
-        out = fixpoint.check(inputs.load(args.bundle, release=stated))
+        try:
+            bundle = inputs.load(args.bundle, release=stated)
+        except inputs.InputError as e:
+            print("yb-model: cannot read the bundle: %s." % e, file=sys.stderr)
+            return 2
+        out = fixpoint.check(bundle)
         print(json.dumps(out, indent=1))
         return 1 if out["problems"] else 0
 
@@ -160,9 +165,18 @@ def main():
     if not os.path.exists(args.bundle):
         print("yb-model: no such bundle: %s" % args.bundle, file=sys.stderr)
         return 2
-    bundle = inputs.load(args.bundle, release=stated)
+    try:
+        bundle = inputs.load(args.bundle, release=stated)
+    except inputs.InputError as e:
+        print("yb-model: cannot read the bundle: %s." % e, file=sys.stderr)
+        return 2
     if not bundle.ddl.strip():
         print("yb-model: no DDL found in %s (expected schema.sql)" % args.bundle, file=sys.stderr)
+        return 2
+    if not analyze.build_schema(bundle).tables:
+        print("yb-model: no table could be read from %s; it may not be a schema dump, or be in "
+              "another encoding or format. Convert a copy of it and run again." % ", ".join(
+                  os.path.basename(p) for p in bundle.ddl_files), file=sys.stderr)
         return 2
 
     from ybm import preflight

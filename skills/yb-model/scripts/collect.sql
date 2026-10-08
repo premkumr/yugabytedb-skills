@@ -11,9 +11,9 @@
 
 \set ON_ERROR_STOP 0
 
-\copy (SELECT 'version' AS key, version() AS value UNION ALL SELECT 'database', current_database() UNION ALL SELECT 'colocated', yb_is_database_colocated()::text UNION ALL SELECT 'postmaster_start', pg_postmaster_start_time()::text UNION ALL SELECT 'captured_at', now()::text) TO 'ybm_meta.csv' CSV HEADER
+\copy (SELECT 'version' AS key, version() AS value UNION ALL SELECT 'database', current_database() UNION ALL SELECT 'colocated', yb_is_database_colocated()::text UNION ALL SELECT 'node', coalesce(host(inet_server_addr()), 'local') || ':' || coalesce(inet_server_port()::text, '') UNION ALL SELECT 'nodes', (SELECT count(*) FROM yb_servers())::text UNION ALL SELECT 'postmaster_start', pg_postmaster_start_time()::text UNION ALL SELECT 'captured_at', now()::text) TO 'ybm_meta.csv' CSV HEADER
 
-\copy (SELECT name, setting FROM pg_settings WHERE name LIKE 'yb\_%' OR name IN ('work_mem', 'enable_bitmapscan', 'enable_seqscan', 'enable_indexscan', 'plan_cache_mode', 'random_page_cost', 'default_statistics_target') ORDER BY name) TO 'ybm_settings.csv' CSV HEADER
+\copy (SELECT name, setting FROM pg_settings WHERE name LIKE 'yb\_%' OR name IN ('work_mem', 'enable_bitmapscan', 'enable_seqscan', 'enable_indexscan', 'plan_cache_mode', 'random_page_cost', 'default_statistics_target', 'search_path') ORDER BY name) TO 'ybm_settings.csv' CSV HEADER
 
 \copy (SELECT schemaname, tablename, attname, inherited, null_frac, avg_width, n_distinct, most_common_vals, most_common_freqs, histogram_bounds, correlation FROM pg_stats WHERE schemaname NOT IN ('pg_catalog', 'information_schema') AND schemaname NOT LIKE 'pg\_%' ORDER BY tablename, attname) TO 'ybm_pg_stats.csv' CSV HEADER
 

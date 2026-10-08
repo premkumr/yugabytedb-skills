@@ -16,7 +16,7 @@ import tempfile
 import time
 
 from . import analyze as an
-from .schema import qi
+from .schema import qi, qn, split_key
 
 INJECT_FN = r"""
 CREATE OR REPLACE FUNCTION ybm_inject(rel regclass, col name, p_null real, p_width int,
@@ -161,11 +161,14 @@ def build_inject_sql(bundle, sch):
         if t.pk and t.pk.name not in rel and tname in rel:
             rel[t.pk.name] = rel[tname]
     for name, n in sorted(rel.items()):
+        schema, rel_name = split_key(name)
         lines.append("UPDATE pg_class SET reltuples = %s, relpages = 0 WHERE relname = %s "
-                     "AND relnamespace = 'public'::regnamespace;" % (float(n), _lit(name)))
+                     "AND relnamespace = %s::regnamespace;" % (
+                         float(n), _lit(rel_name), _lit(qi(schema or "public"))))
     for (t, c), st in sorted(bundle.stats.items()):
         mcf = "ARRAY[%s]::real[]" % ",".join(repr(x) for x in st["mcf"]) if st["mcf"] else "NULL"
-        regclass = _lit("public." + qi(t))  # to_regclass folds unquoted names to lower case
+        # to_regclass folds unquoted names to lower case; a key outside public is qualified
+        regclass = _lit(qn(t) if split_key(t)[0] else "public." + qi(t))
         lines.append(
             "SELECT ybm_inject(to_regclass(%s), %s, %s, %d, %s, %s, %s, %s, %s) "
             "WHERE to_regclass(%s) IS NOT NULL;" % (
@@ -226,6 +229,8 @@ def settings_sql(bundle, mode, tag=None, assumed=None, boot=None):
                    "RAISE NOTICE 'ybm: setting %s not applied: %%', SQLERRM; END $g$;"
                    % (_lit(k), _lit(gucs[k]), re.sub(r"[^a-z_]", "", k)))
     out.append("SET plan_cache_mode = force_generic_plan;")
+    # Unqualified names resolve as the review resolved them (analyze.search_path).
+    out.append("SET search_path = %s;" % ", ".join(qi(s) for s in an.search_path(bundle)))
     return "\n".join(out) + "\n", gucs
 
 
@@ -244,10 +249,10 @@ def patterns_sql(patterns, outdir):
         lines.append("\\o %s/%s.json" % (outdir, p["id"]))
         if n:
             lines.append("PREPARE %s AS %s;" % (name, q))
-            lines.append("EXPLAIN (FORMAT JSON) EXECUTE %s(%s);" % (name, ", ".join(["NULL"] * n)))
+            lines.append("EXPLAIN (VERBOSE, FORMAT JSON) EXECUTE %s(%s);" % (name, ", ".join(["NULL"] * n)))
             lines.append("DEALLOCATE %s;" % name)
         else:
-            lines.append("EXPLAIN (FORMAT JSON) %s;" % q)
+            lines.append("EXPLAIN (VERBOSE, FORMAT JSON) %s;" % q)
         lines.append("\\o")
     return "\n".join(lines) + "\n"
 

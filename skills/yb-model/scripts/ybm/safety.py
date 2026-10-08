@@ -24,8 +24,15 @@ from . import sqlshape
 
 # The index a table swap leaves behind on the retired table (analyze._old_index_note): gone
 # afterwards, but never a DROP INDEX the reader runs.
-RETIRED = re.compile(r'--\s*(\w+|"(?:[^"]|"")+") is not created on the new table')
-REKEY = re.compile(r'--\s*CREATE TABLE (\w+|"(?:[^"]|"")+") \(\.\.\. PRIMARY KEY \((.+)\)\)')
+_QNAME = r'((?:\w+|"(?:[^"]|"")+")(?:\.(?:\w+|"(?:[^"]|"")+"))?)'
+RETIRED = re.compile(r'--\s*%s is not created on the new table' % _QNAME)
+REKEY = re.compile(r'--\s*CREATE TABLE %s \(\.\.\. PRIMARY KEY \((.+)\)\)' % _QNAME)
+
+
+def _key_of(text):
+    """The relation key of a possibly qualified, possibly quoted name as DDL writes it."""
+    name, _ = schema_mod._name(rebase(tokenize(text)), 0)
+    return name
 
 
 class _Stmt(list):
@@ -41,15 +48,12 @@ def changes_of(ddl):
     for line in ddl.splitlines():
         m = REKEY.search(line)
         if m:
-            name = m.group(1)
-            if name.startswith('"'):
-                name = name[1:-1].replace('""', '"')
-            if name.endswith("_new"):
+            name = _key_of(m.group(1))
+            if name and name.endswith("_new"):
                 out.append(("rekey", name[:-4], m.group(2)))
         m = RETIRED.search(line)
         if m:
-            name = m.group(1)
-            out.append(("retire", name[1:-1].replace('""', '"') if name.startswith('"') else name))
+            out.append(("retire", _key_of(m.group(1))))
     body = "\n".join(l for l in ddl.splitlines() if not l.lstrip().startswith("--"))
     body = re.sub(r"--[^\n]*", "", body)
     for st in split_statements(tokenize(body)):
@@ -59,16 +63,17 @@ def changes_of(ddl):
         words = [t.up for t in st[:4] if t.kind == "word"]
         up = [t.up for t in st if t.kind == "word"]
         if up[:2] == ["ALTER", "TABLE"] and "DROP" in up and "CONSTRAINT" in up:
-            k = up.index("CONSTRAINT")
-            rest = [t.ident for t in st if t.kind in ("word", "qident")][k + 1:]
-            rest = [x for x in rest if x not in ("if", "exists")]
-            if rest:
-                out.append(("drop", rest[0]))
+            table, _ = schema_mod._name(st, schema_mod._skip_words(st, 2, "IF", "EXISTS", "ONLY"))
+            k = next(n for n, t in enumerate(st) if t.kind == "word" and t.up == "CONSTRAINT")
+            cname, _ = schema_mod._name(st, schema_mod._skip_words(st, k + 1, "IF", "EXISTS"))
+            if cname:  # a constraint's index lives in its table's schema
+                out.append(("drop", schema_mod.in_schema_of(table, cname)))
             continue
         if words[:1] == ["DROP"] and "INDEX" in words:
-            name = [t.ident for t in st if t.ident and t.up not in
-                    ("DROP", "INDEX", "CONCURRENTLY", "IF", "EXISTS")][-1]
-            out.append(("drop", name.split(".")[-1]))
+            name, _ = schema_mod._name(st, schema_mod._skip_words(
+                st, 2, "CONCURRENTLY", "IF", "EXISTS"))
+            if name:
+                out.append(("drop", name))
         elif words[:1] == ["CREATE"] and "INDEX" in words:
             stmt = _Stmt(st)
             stmt.sql = body
@@ -388,15 +393,15 @@ def _repoint_fks(ddl, blocked):
         chs = changes_of(line)
         fks = [fk for name, fk in blocked if chs == [("drop", name)]]
         for fk in fks:
-            out.append("ALTER TABLE %s DROP CONSTRAINT %s;" % (schema_mod.qi(fk.table),
-                                                              schema_mod.qi(fk.name)))
+            out.append("ALTER TABLE %s DROP CONSTRAINT %s;" % (schema_mod.qn(fk.table),
+                                                              schema_mod.qi(schema_mod.bare(fk.name))))
         out.append(line)
         for fk in fks:
             out.append("ALTER TABLE %s ADD CONSTRAINT %s %s%s;" % (
-                schema_mod.qi(fk.table), schema_mod.qi(fk.name), fk.clause,
+                schema_mod.qn(fk.table), schema_mod.qi(schema_mod.bare(fk.name)), fk.clause,
                 "" if re.search(r"\bNOT\s+VALID\b", fk.clause, re.I) else " NOT VALID"))
-            out.append("ALTER TABLE %s VALIDATE CONSTRAINT %s;" % (schema_mod.qi(fk.table),
-                                                                  schema_mod.qi(fk.name)))
+            out.append("ALTER TABLE %s VALIDATE CONSTRAINT %s;" % (schema_mod.qn(fk.table),
+                                                                  schema_mod.qi(schema_mod.bare(fk.name))))
     return "\n".join(out)
 
 
@@ -460,7 +465,8 @@ def check(sch, patterns, col, an, ps, bundle, Finding):
                          if sch.is_colocated(table) else "(%s) HASH" % ", ".join(keycols))
                 adds.append("CREATE UNIQUE INDEX CONCURRENTLY %s ON %s (%s)%s%s;  -- added "
                             "by the safety check: keeps the uniqueness %s enforces" % (
-                                schema_mod.qi(schema_mod.ident(iname)), schema_mod.qi(table),
+                                schema_mod.qi(schema_mod.ident(schema_mod.bare(iname))),
+                                schema_mod.qn(table),
                                 group, " NULLS NOT DISTINCT" if _nnd(sch, name) else "",
                                 (" WHERE %s" % where) if where else "", name))
             f.ddl = f.ddl + "\n" + "\n".join(adds)

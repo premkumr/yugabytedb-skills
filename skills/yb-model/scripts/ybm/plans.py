@@ -9,6 +9,8 @@ did not predict.
 
 import re
 
+from .sqltok import in_schema_of, rel_key
+
 SCAN_NODES = ("Seq Scan", "Index Scan", "Index Only Scan", "Bitmap Heap Scan",
               "YB Bitmap Table Scan", "Bitmap Index Scan", "YB Seq Scan")
 
@@ -31,13 +33,16 @@ def summarize(plan_json, sch):
         nt = n.get("Node Type", "")
         facts["nodes"].append(nt)
         rel = n.get("Relation Name")
+        if rel:  # the plan names relations bare; key them as the schema model does
+            rel = rel_key(n["Schema"], rel) if n.get("Schema") else (
+                sch.rel(None, rel) if hasattr(sch, "rel") else rel)
         if nt in SCAN_NODES and rel:
             base = rel
             t = sch.tables.get(rel)
             if t is not None and t.partition_of:
                 base = t.partition_of
             facts["scans"].append({"node": nt, "relation": rel, "table": base,
-                                   "index": n.get("Index Name"),
+                                   "index": in_schema_of(rel, n.get("Index Name")),
                                    "index_cond": n.get("Index Cond"),
                                    "rows": n.get("Plan Rows"),
                                    "storage_filter": n.get("Storage Filter") or

@@ -30,6 +30,7 @@ finding ID, or "not in engine". Never edit the findings table by hand.
 
 | File | Read when |
 |---|---|
+| `references/pitfalls.md` | Before every review, and whenever something does not work as expected. Things to be wary of. |
 | `references/engine.md` | Step 4. What each output field means; how to read replay results. |
 | `references/intake.md` | Step 1. What to ask for, and the exact capture commands. |
 | `references/validation.md` | Step 5. Live-cluster checks the engine cannot do. |
@@ -41,13 +42,17 @@ finding ID, or "not in engine". Never edit the findings table by hand.
 Copy this checklist and tick it off.
 
 ```
+- [ ] 0. references/pitfalls.md read
 - [ ] 1. Inputs gathered into one directory
 - [ ] 1b. Preflight ran; if it asked, the user said yes or no
+- [ ] 1c. Any input the engine could not read converted (a copy) and named in NOTES
 - [ ] 2. Engine ran (review.md, review.json and chat.md exist)
 - [ ] 3. Replay ran, or the reason it did not is recorded
 - [ ] 4. User context added to review.md, or the NOTES line deleted
 - [ ] 5. Limitations stated
 - [ ] 6. (optional) Second pass recorded under Reviewer notes
+- [ ] 7. chat.md pasted as the chat message
+- [ ] 8. Anything that did not work as expected written to pitfall-candidates.md
 ```
 
 ### 1. Gather
@@ -65,6 +70,8 @@ gave you into it unchanged:
 - The `ybm_*.csv` files from `scripts/collect.sql`.
 - A `pg_stat_statements` export, saved as `ybm_pss.csv`.
 - A `pg_stats` export, saved as `ybm_pg_stats.csv`.
+- Captures from several nodes, one subfolder each (`node1/`, `node2/`, ...). Usage counters
+  are per node; the engine adds the folders up.
 
 Exports often arrive in another shape (tab-separated, document or spreadsheet tables,
 aggregates over nodes). Look at what you were given first, then write a one-off converter
@@ -113,6 +120,16 @@ names the candidates it withheld. A weakened rule still runs, and each finding i
 carries a caveat such as `sharding inferred`. The mapping lives in `rules/inputs.json`; do not
 re-derive it.
 
+### 1c. When the engine cannot read an input
+
+If preflight or the engine exits 2 naming a file (UTF-16, another delimiter, a missing header,
+no table read from the schema), or a review comes back with far fewer tables than the dump
+holds, find the cause before anything else: look at the file's first bytes and lines. Then
+write a one-off converter that writes a corrected copy into a new bundle directory, run again
+on that copy, and say in the NOTES line what you converted and why. Never change values or
+the customer's originals. `references/pitfalls.md` lists the causes seen so far. If yours is
+new, record it (step 8).
+
 ### 2. Run the engine
 
 ```bash
@@ -140,7 +157,7 @@ The engine writes `review.md`, `review.json`, `chat.md` (the chat message) and, 
 
 - **0:** no findings at high or above.
 - **1:** findings at high or above. This is not a failure.
-- **2:** the engine failed. Show the error.
+- **2:** the engine failed. Show the error. If it names an input file, go to step 1c.
 - **3:** inputs are missing and were not accepted. Go back to step 1b.
 
 If the engine cannot run on this surface, say so and review by hand with
@@ -244,6 +261,16 @@ with their fixes, the review level and, for an incomplete review, the missing in
 withheld candidates, and it ends with the path to `review.md`. You may add at most two
 sentences after it, under "Reviewer note:", with context the user gave you. Never restate or
 summarise findings in your own words: that is where reviews pick up wrong numbers.
+
+
+### 8. Record what surprised you
+
+If any step did not work as expected (an input in an unforeseen shape, a finding you had to
+correct under Reviewer notes, an error you had to work around), add one entry to
+pitfall-candidates.md next to review.md: the symptom, the cause and what you did. Keep it
+generic: no customer names, table names or values. Maintainers move useful entries into
+`references/pitfalls.md` or fix the engine. Do this after delivering (step 7); do not mention
+it in the chat message.
 
 ## Other skills
 

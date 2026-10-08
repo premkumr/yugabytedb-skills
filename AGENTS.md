@@ -220,6 +220,10 @@ including iterative rule improvements, follow these rules:
 - **State what a statistic can show on YSQL.** For example, `pg_stats.correlation` follows the
   primary key's order, not insert order. A rule that reads a statistic says what it rests on,
   and holds back rather than guesses when the statistic cannot decide.
+- **Every surprise ends in a fix or a pitfall.** When a review hits something the skill did
+  not expect (reviewers record these in `pitfall-candidates.md`), either fix the engine with a
+  test or add a generic entry to `skills/yb-model/references/pitfalls.md`: symptom, cause,
+  what to do. Never put customer names, table names or values there.
 - **The chat message is engine-written.** `review` writes `chat.md` from `review.json`; the
   skill pastes it. Do not move wording the user sees back into model-written text.
 - **Keep PRs reviewable.** The hosted reviewer stops at 3,000 changed lines; split larger
