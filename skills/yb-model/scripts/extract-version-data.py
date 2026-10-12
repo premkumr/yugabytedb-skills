@@ -168,13 +168,14 @@ def guc_defaults(src, tag):
 def gflag_defaults(src, tag, paths):
     out = {}
     for g in GFLAGS:
-        hits = src.grep(tag, r"DEFINE_[A-Za-z_]+\(%s," % g, "src/yb", context=3)
+        hits = src.grep(tag, r"DEFINE_[A-Za-z0-9_]+\(%s," % g, "src/yb", context=3)
         if not hits:
             out[g] = None
             continue
         paths.setdefault("src/yb", set()).add(hits[0][0])
         text = "\n".join(t for _, t in hits)
-        m = re.search(r"DEFINE_([A-Za-z_]+)\(\s*%s\s*,([^;]*?)\)\s*;" % g, text, re.S)
+        # DEFINE_RUNTIME_bool, DEFINE_UNKNOWN_int32, ...: the type may carry digits
+        m = re.search(r"DEFINE_([A-Za-z0-9_]+)\(\s*%s\s*,([^;]*?)\)\s*;" % g, text, re.S)
         if not m:
             out[g] = None
             continue
@@ -273,9 +274,11 @@ def main():
     args = ap.parse_args()
     here = os.path.dirname(os.path.abspath(__file__))
     out = args.out or os.path.join(here, "..", "rules", "versions.json")
-    rules = json.load(open(os.path.join(here, "..", "rules", "rules.json")))["rules"]
+    with open(os.path.join(here, "..", "rules", "rules.json")) as fh:
+        rules = json.load(fh)["rules"]
     try:
-        data = json.load(open(out))
+        with open(out) as fh:
+            data = json.load(fh)
     except (OSError, ValueError):
         data = {}
     data.setdefault("tags", {})

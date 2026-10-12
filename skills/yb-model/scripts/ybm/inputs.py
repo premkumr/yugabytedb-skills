@@ -61,22 +61,61 @@ class _Row(dict):
                          "another delimiter" % (self.file, key))
 
 
+class _Rows(list):
+    """The rows of one file, with its column names (the CSV header)."""
+    fields = ()
+    file = None
+
+    def need(self, *columns):
+        """Stop on a column the file needs and lacks; a tuple names alternatives. A value
+        column read with a default would otherwise load silently: no idx_scan column would
+        make every index look unused."""
+        have = set(self.fields)
+        for c in columns:
+            alts = c if isinstance(c, tuple) else (c,)
+            if have.isdisjoint(alts):
+                raise InputError("%s has no %s column%s: the header row is missing or names it "
+                                 "differently" % (self.file, alts[0], (" (or %s)" % ", ".join(
+                                     alts[1:])) if len(alts) > 1 else ""))
+        return self
+
+
 def _rows(path):
     if path.endswith(".json"):
         data = json.loads(read_text(path))
-        return data if isinstance(data, list) else data.get("rows", [])
+        rows = data if isinstance(data, list) else data.get("rows", [])
+        out = _Rows(rows)
+        out.fields = sorted({k for r in rows if isinstance(r, dict) for k in r})
+        out.file = os.path.basename(path)
+        return out
     text = read_text(path)
     head = text.split("\n", 1)[0]
     if "," not in head and (";" in head or "\t" in head):
         raise InputError("%s is separated by %s, not commas; convert a copy of it to CSV" % (
             os.path.basename(path), "semicolons" if ";" in head else "tabs"))
     name = os.path.basename(path)
-    out = []
-    for r in csv.DictReader(io.StringIO(text, newline="")):
+    out = _Rows()
+    reader = csv.DictReader(io.StringIO(text, newline=""))
+    for r in reader:
         row = _Row(r)
         row.file = name
         out.append(row)
+    out.fields, out.file = tuple(reader.fieldnames or ()), name
     return out
+
+
+def _found(b, path, stem):
+    """_find, leaving an empty file out and recording it in b.empty_files."""
+    p = _find(path, stem)
+    if p and not _has_bytes(p):
+        b.empty_files.append(os.path.relpath(p, b.path) if b.path else os.path.basename(p))
+        return None
+    return p
+
+
+def _has_bytes(p):
+    with open(p, "rb") as fh:
+        return bool(fh.read(4096).strip())
 
 
 def _find(bundle, stem):
@@ -158,6 +197,8 @@ class Bundle:
         self.stated_release = None      # the release the user stated (--release)
         self.captures = []     # node of each capture whose usage counters were read
         self.duplicate_captures = []  # (node, folder) skipped: that node was already read
+        self.capture_label_fallbacks = []  # folders named by folder: loopback/socket address
+        self.empty_files = []  # capture files with no content (their query failed), left out
         self.cluster_nodes = None  # nodes in the cluster (ybm_meta.csv nodes), if known
 
     def release_sources(self):
@@ -203,7 +244,11 @@ class Bundle:
     def usage_complete(self):
         """Do the usage counters (pg_stat_statements, pg_stat_user_indexes and _tables) cover
         every node? Each node counts only the statements that ran through it."""
-        return self.cluster_nodes is not None and len(set(self.captures)) >= self.cluster_nodes
+        if self.cluster_nodes is None or len(set(self.captures)) < self.cluster_nodes:
+            return False
+        # Captures named by their folder (taken over localhost or a socket) cannot show that
+        # they came from different nodes: a folder may repeat another one's node.
+        return not (self.capture_label_fallbacks and self.cluster_nodes > 1)
 
     @property
     def version(self):
@@ -283,6 +328,7 @@ def load(path, release=None):
             if os.path.isdir(d) and glob.glob(os.path.join(d, "ybm_*.*")):
                 node = Bundle(d)
                 _load_tables(node, d)
+                b.empty_files.extend(os.path.join(sub, f) for f in node.empty_files)
                 label = _capture_label(node, d)
                 if _has_usage(node) and label in b.captures:
                     b.duplicate_captures.append((label, sub))  # counted once, not twice
@@ -298,14 +344,26 @@ def _has_usage(cap):
     return bool(cap.pss or cap.index_usage or cap.table_usage)
 
 
+_LOOPBACK = re.compile(r"^(?:127\.\d+\.\d+\.\d+|::1|localhost|local|)(?::\d*)?$", re.I)
+
+
 def _capture_label(cap, path):
-    return cap.meta.get("node") or os.path.basename(os.path.normpath(path))
+    """The node a capture came from: the server address collect.sql recorded, or the folder
+    name when that address says nothing about the node (none, a loopback address or a Unix
+    socket: collect.sql run on each host over localhost labels every node alike)."""
+    node = (cap.meta.get("node") or "").strip()
+    if node and not _LOOPBACK.match(node):
+        return node
+    return os.path.basename(os.path.normpath(path))
 
 
 def _note_capture(b, cap, path):
     """Record the node a capture came from when it has usage counters, and the cluster size."""
     if _has_usage(cap):
         b.captures.append(_capture_label(cap, path))
+        node = (cap.meta.get("node") or "").strip()
+        if node and _LOOPBACK.match(node):
+            b.capture_label_fallbacks.append(os.path.basename(os.path.normpath(path)))
     n = _f(cap.meta.get("nodes"))
     if n is not None and n >= 1:
         b.cluster_nodes = max(b.cluster_nodes or 0, int(n))
@@ -360,10 +418,15 @@ def _merge(b, node):
 
 
 def _load_tables(b, path):
-    p = _find(path, "ybm_pg_stats")
+    """Read every capture file of one folder into b. A file with no bytes but whitespace is
+    left out: psql's \\copy creates its file before the query runs, so a query that failed
+    during capture (pg_stat_statements not installed, an older release) leaves an empty file,
+    which is a missing input, not an unreadable one."""
+    p = _found(b, path, "ybm_pg_stats")
     if p:
         b.present.append(os.path.basename(p))
-        rows = _rows(p)
+        rows = _rows(p).need("tablename", "attname", (
+            "null_frac", "n_distinct", "most_common_vals", "histogram_bounds", "correlation"))
         # Nodes that disagree can list one column once per variant. Keep one row per key: the
         # one most nodes reported if the file has nodes_reporting (a tie keeps the first),
         # else the first. The keys listed more than once go to b.stats_duplicates.
@@ -388,10 +451,11 @@ def _load_tables(b, path):
                 "correlation": _f(r.get("correlation")),
             }
         b.stats_duplicates = sorted((t, c, n) for (t, c), n in n_rows.items() if n > 1)
-    p = _find(path, "ybm_pss")
+    p = _found(b, path, "ybm_pss")
     if p:
         b.present.append(os.path.basename(p))
-        for r in _rows(p):
+        for r in _rows(p).need("query", "calls", ("total_exec_time", "total_time",
+                                                    "mean_exec_time", "mean_time")):
             q = r.get("query") or ""
             row = {"queryid": str(r.get("queryid", "")), "query": q,
                    "calls": _f(r.get("calls"), 0.0),
@@ -407,38 +471,45 @@ def _load_tables(b, path):
             if not row["mean_ms"] and row["calls"]:
                 row["mean_ms"] = row["total_ms"] / row["calls"]
             b.pss.append(row)
-    p = _find(path, "ybm_reltuples")
+    p = _found(b, path, "ybm_reltuples")
     if p:
         b.present.append(os.path.basename(p))
-        for r in _rows(p):
+        for r in _rows(p).need("relname", "reltuples"):
             b.reltuples[rel_key(r.get("schemaname"), r["relname"])] = _f(r.get("reltuples"), -1.0)
-    p = _find(path, "ybm_index_usage")
+    p = _found(b, path, "ybm_index_usage")
     if p:
         b.present.append(os.path.basename(p))
-        for r in _rows(p):
+        for r in _rows(p).need("indexrelname", "idx_scan"):
             b.index_usage[rel_key(r.get("schemaname"), r["indexrelname"])] = {
                 "table": rel_key(r.get("schemaname"), r.get("relname", "")),
                 "idx_scan": _f(r.get("idx_scan"), 0.0)}
-    p = _find(path, "ybm_table_usage")
+    p = _found(b, path, "ybm_table_usage")
     if p:
         b.present.append(os.path.basename(p))
         for r in _rows(p):
             b.table_usage[rel_key(r.get("schemaname"), r["relname"])] = {k: _f(v) for k, v in r.items()
                                                    if k != "relname" and k != "schemaname"}
-    p = _find(path, "ybm_settings")
+    p = _found(b, path, "ybm_settings")
     if p:
         b.present.append(os.path.basename(p))
-        for r in _rows(p):
+        for r in _rows(p).need("name", "setting"):
             b.settings[r["name"]] = r.get("setting")
-    p = _find(path, "ybm_meta")
+    p = _found(b, path, "ybm_meta")
     if p:
         b.present.append(os.path.basename(p))
-        for r in _rows(p):
+        rows = _rows(p)
+        if "key" in rows.fields:
+            rows.need("key", "value")
+        elif not rows.fields or not all(re.match(r"^[a-z_]+$", f or "") for f in rows.fields):
+            # A wide file has a header of names (version, nodes, ...); without a header the
+            # first row's values (a version string) would be read as names.
+            rows.need("key")
+        for r in rows:
             if "key" in r:
                 b.meta[r["key"]] = r.get("value")
             else:
                 b.meta.update(r)
-    p = _find(path, "ybm_tablets")
+    p = _found(b, path, "ybm_tablets")
     if p:
         b.present.append(os.path.basename(p))
         for r in _rows(p):

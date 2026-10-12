@@ -44,6 +44,15 @@ findings resting only on such statements carry the caveat
 because their traffic is unknown. Without `pg_stat_statements`, every pattern is UNRANKED and
 severity is not traffic-weighted.
 
+For each pattern and the index it reads through, the engine records a *key binding map*: how
+the pattern constrains each key column in key order (equality, IN list, range, equality in
+every OR arm, filter only, or not at all). From it come the bound prefix DocDB seeks on, the
+gap after it, and the columns bound after the gap, which DocDB reaches by seeking under every
+value of the gap. The access table prints the map; `review.json` holds it under
+`access.binding`. An OR is a disjunction of its arms (OR binds looser than AND); a column every
+arm binds with equality is bound arm by arm only when the planner turns the arms into a
+BitmapOr, so the map shows it apart (`or=`).
+
 ## 3. Rule families
 
 | Prefix | Source | Example |
@@ -55,7 +64,6 @@ severity is not traffic-weighted.
 | `CFG` | `pg_settings` | Cost model off, default sharding is ASC |
 | `PLN` | Replayed plans only | Seq Scan on a large table that no static rule predicted; the fix says what the planner chose and names the pattern's other findings |
 | `LINT-YB*` | `yb-lint.py` | Clause order, missing `TABLETS` keyword, redundant prefix index |
-| `SAF` | Safety pass over the engine's own DDL | A fix that would lose a uniqueness guarantee, an ON CONFLICT target, or a plan |
 
 Rules marked `"section": "hygiene"` in `rules.json` (WRK005 to WRK010) describe how the
 application uses the database. The report lists them under *Workload hygiene*, keeps them out
@@ -65,7 +73,7 @@ of the headline, and words their fixes for the application team.
 `src/postgres/src/test/regress/expected/<file>` in yugabyte-db at the customer's release tag
 and search for the string. Only rules that claim planner or execution behaviour (`CAP`,
 `PLN`) cite tests, and `scripts/check-rule-refs.py` fails if one does not. `STA`, `WRK`, `CFG`,
-`SPL`, `SAF` and lint rules are arithmetic on the bundle; their *Basis* line names the inputs
+`SPL` and lint rules are arithmetic on the bundle; their *Basis* line names the inputs
 that rule family reads and the bundle has (for example "the schema DDL, pg_stats and row
 counts"; lint findings: the schema DDL only).
 
@@ -90,20 +98,30 @@ says, otherwise the first, and the open items name the columns.
 rather than one specific value. Settings are copied from the customer's `pg_settings`
 unless `--mode on|off` forces the cost model.
 
-During reconciliation, each static access-path finding is checked against the replayed plan
-of its patterns:
+With replay, the access a pattern takes on each table is the replayed plan's: the index it
+scans (a partition's scan counts for its partitioned table, its index copy for the parent's
+index) and the plan's own key binding, or a sequential scan. The access-path rules (CAP001,
+CAP002, CAP003, CAP012, CAP013, CAP014, CAP020, CAP021, CAP031, CAP040, CAP050, CAP051) read
+that access, so their findings describe what the plan does:
 
-- **Matched:** the finding becomes `confirmed (replay)`.
-- **Contradicted, settings known:** the finding is removed and listed under *Findings
-  removed because the replayed plan contradicted them*. Read that list: it is where the
-  static rules are weakest.
-- **Contradicted, settings assumed:** when the bundle has no pg_settings, replay runs under
-  assumed planner settings (the release default, or the image's compiled default when no
-  release facts are cached; the report lists them). A contradiction then only *disputes* the
-  finding: it moves to the *Disputed by replay* section, out of the recommended DDL and action
-  items, and stays visible. A false positive is preferred to losing a real problem on a guess.
-  Probes follow the same rule.
-- **Planner chose a different path:** the finding keeps `probable` and shows the chosen path.
+- **The plan took the access:** the finding is `confirmed (replay)` (labelled with the
+  replay image when it is the nearest earlier release, and "planner settings assumed" when
+  the bundle had no pg_settings: the plan still stands) and shows each pattern's scan.
+- **The model would have chosen otherwise:** the model's choice is not reported as a finding;
+  the disagreement is recorded as a `path` gap (review.json gaps), so it stays auditable.
+- **The plan was chosen without the customer's statistics (`pg_stats` or table sizes):** it
+  corroborates only. The model's choice is the access, findings stay `probable`, and each
+  pattern where the plan chose differently is listed under Validation (`path` gaps).
+- **The pattern did not plan, or replay ran on another release with unknown differences (or
+  a difference in an access rule's tested behaviour):** the model's choice is the access, and
+  the finding stays `probable`.
+
+The rules about what a plan does with the rows it reads (CAP010 and CAP011, a sort; CAP030,
+partitions appended) are still checked against the plan: matched, confirmed; contradicted
+with settings known, removed and listed; contradicted with settings assumed, disputed (the
+*Disputed by replay* section). Probes follow the same rule. Plans chosen without statistics
+only agree (the finding stays probable) or dispute, and raise no plan-only finding (PLN001 to
+PLN003).
 
 Replay plans are estimates. Injected statistics do not reproduce cache state, network
 latency, tablet leadership or contention.
@@ -122,33 +140,43 @@ During replay, the engine runs the probes of the rules that fired, in the same c
 customer's release, or the newest earlier image in its line) under the same planner settings.
 Verdicts: **holds** (the finding names the release and the counters), **refuted** (the
 finding is withdrawn and listed with the counters), **inconclusive** (the finding says
-unverified). Without replay, the finding says its mechanism is unverified on the release.
+unverified). On an image of another release whose differences to the customer's are unknown,
+or that changed the rule's tested behaviour, a probe neither confirms nor refutes: the finding
+stays and says so. Under assumed planner settings a refutation only disputes the finding. Without replay, the finding says its mechanism is unverified on the release.
 Nothing is stored: a new release is checked by running the review on it.
 `yb-model.py probe --image <img>` runs the probes alone.
 
-## 5. Safety pass
+## 5. Checking options
 
-Before the report is written, `ybm/safety.py` applies each finding's DDL to a copy of the
-schema, alone and then all together, and compares the result with the original:
+Before the report is written, `ybm/safety.py` checks every option the engine can model, one
+at a time: its own sketch of an option, a drop of a non-unique index (after the every-node
+check), and options that change no schema. Each is applied alone to a model of the schema and
+compared with the original; what it would lose is shown with the option as its costs. Options
+are alternatives, so they are not applied together here; the combination the reviewer and
+the user choose is checked by `yb-model.py plan`. Nothing is amended and nothing is chosen:
 
 - Every PRIMARY KEY and UNIQUE guarantee must survive, on the same or fewer columns and with
   a predicate that is no narrower. `col IS NOT NULL` on a key column does not narrow it: rows
   whose key holds a NULL never conflict, unless the index is NULLS NOT DISTINCT, which the
-  replacement must then keep. If a fix would lose one, the pass adds the UNIQUE
-  index that keeps it, and marks the row `amended`. Statistics rules never suggest dropping a primary
-  key or a unique index; their fix is a re-key on the same columns.
+  replacement must then keep. An option that would lose one carries that cost. No drop is
+  offered for a primary key or a unique index. STA002/STA003 on one say in their text what
+  each option they offer would do to the guarantee (composite makes only the wider key unique;
+  STA003's separate_hot_value leaves the dominant value's rows out); those options are not
+  modelled, and they are decisions, never suggestions.
 - A foreign key depends on the unique index (or primary key) it was created against, and that
   index cannot be dropped while the key exists. When a fix drops one, the pass re-points the
   key: it is dropped just before the index and added back as written, `NOT VALID` and then
-  validated, provided the fix leaves a unique index without a predicate on exactly the
-  referenced columns; otherwise the DDL is withheld and the fix says why. A primary-key change
+  validated, provided the option leaves a unique index without a predicate on exactly the
+  referenced columns (this is how its DDL is written, not a change to it); otherwise its DDL
+  is withheld and the option says why in its costs. A primary-key change
   (a table swap) lists the foreign keys to move in its comment lines.
 - Every `INSERT ... ON CONFLICT` must still find its arbiter: a unique index on exactly its
   columns (a partial one only when the statement repeats the predicate), or for `ON CONFLICT
   ON CONSTRAINT name` the primary key or unique constraint of that name.
 - Every ranked pattern is planned again. Losing an access path, a point lookup, index order
   or coverage is a regression.
-- A pure `DROP INDEX` of an index that `pg_stat_user_indexes` shows was scanned is flagged.
+- A pure `DROP INDEX` of an index that `pg_stat_user_indexes` shows was scanned is a cost.
+- A new index that brings back a defect (a NULL-heavy hash lead, a boolean key) is a cost.
 
 How the DDL is written: a replacement index is derived from the original
 (`schema.index_sql`), so UNIQUE (with NULLS NOT DISTINCT), INCLUDE, the predicate as written,
@@ -161,12 +189,41 @@ unique index on a subset of the ON CONFLICT columns when there is one (the state
 target it), and otherwise hashes the new unique index on a NOT NULL, high-cardinality column.
 Names are written as YSQL needs them (quoted when mixed case, special or reserved) and an
 expression keeps the quotes of the names in it, so a quoted mixed-case schema gets the same
-recommendations as a lower-case one. A primary-key change, which YSQL cannot make in place, is
-written as comment lines (`-- CREATE TABLE ..._new (... PRIMARY KEY (...))`) that the safety
-pass reads; a colocated table gets range keys and no SPLIT clause.
+options as a lower-case one. A primary-key change, which YSQL cannot make in place, is
+written as comment lines (`-- CREATE TABLE ..._new (... PRIMARY KEY (...))`); a colocated
+table gets range keys and no SPLIT clause. A new index goes through `schema.new_index_sql`: no
+CONCURRENTLY on a partitioned table, and no unique index there without its partition key.
+Every modelled option is held as structured changes (review.json `changes`: create, drop,
+check, rekey, retire, fk), and DDL is rendered from them only when asked for; the checks, the
+plan and the self-check work on the structure. No finding settles another: two findings on
+one object keep their own options, and the area makes them one decision.
 
-Side effects that cannot be amended mechanically become `SAF001`, or `SAF002` when they only
-appear once the fixes are combined.
+### Options, suggestions and decisions
+
+A rule states why something matters and offers options (`options` in `rules/rules.json`:
+label, when it fits, the trade-off, what to check first, and the kind of change: none, add,
+rebuild, drop, rekey, column; every rule has `keep`). A finding's own text gives reasons; it
+never instructs a change or carries a statement. The engine models one option per finding by
+default, the first of its sketch's kind (`sketched`), plus the drop and no-change options it
+can model, and checks each (`checked`, `costs`).
+
+`review.json` `dossiers` groups findings by area (tables joined by partitioning or a foreign
+key). Each area holds:
+
+- **suggestions**: the only finding on its object, whose modelled option only adds something
+  (a new index) and has no cost; anything that drops, rebuilds or re-keys is never one; offered
+  with its reasons, and taken into a plan unless the plan chooses otherwise;
+- **decisions**: every other finding with options: an object several findings name, or a
+  modelled option that drops, rebuilds or re-keys something (however clean it checks), has a
+  cost, or could not be checked; the reviewer consolidates them (SKILL.md step 4b) and the
+  user decides;
+- **notes**: findings with no options;
+- what any change there must keep true (unique guarantees, the index each foreign key and ON
+  CONFLICT target relies on, the indexes ranked patterns read through and how, partition
+  copies, indexes the counters show in use), and its tensions.
+
+The review document prints no DDL. `yb-model.py sketch <bundle> <finding> --option <id>`
+prints it for a chosen option, with what checking it found.
 
 ## 6. Releases and deployment tools
 
@@ -207,8 +264,10 @@ customer's release still does. A release older than everything cached has no sta
 GitHub-built entries record a deployment tool whose overrides could not be checked as
 *unverified*, which makes the settings it might change conditional.
 
-Replay picks the exact image, or else the newest earlier image of the same release line
-(never a newer one). It sets the customer's effective planner settings explicitly, so the
+Replay picks the exact image, or else the newest earlier image of the same release line,
+or else the oldest newer one of that line (`--image` names one outright). A non-exact image's
+labels say whether it is an earlier or a newer release, and its differences from the
+customer's release apply as above (unknown differences confirm nothing). It sets the customer's effective planner settings explicitly, so the
 container launcher's defaults never apply: from the bundle, else the release default, else
 (no release facts) the image's own compiled defaults, recorded as assumed. It records the
 drift between the two releases and does not let replay confirm a rule whose tested behaviour
@@ -217,12 +276,59 @@ different image confirms and refutes nothing.
 
 ## 7. Self-checks
 
+- **The server as oracle** (with replay): the engine's own models are predictions and the
+  replayed plan is the answer. `server.py` reads the plan's deparsed conditions (Index Cond,
+  filters, BitmapOr arms) with a reader of its own and gives, per pattern, the plan's key
+  binding map for the index it chose; that binding is the pattern's access (above), and each
+  disagreement with the model's binding is a `bind.pred` gap (counted under Validation); a
+  different index or a scan is a `path` gap, listed there by pattern. Replay also records each statement's
+  parameter types (`pg_prepared_statements`); the measured pass binds literals and parameters
+  by the plan, and a parameter no condition places gets a neutral value of its type. A
+  statement the server cannot prepare as written is handed over rewritten (`COPY (q) TO` is q;
+  `database.schema.table` is `schema.table`). Every disagreement and rewrite is recorded in
+  `review.json` `gaps` (layers `bind.pred`, `bind.param`, `bind.reader`, `statement`), and the
+  review counts them under Validation.
+- **Measured pass** (`review --replay --measure`): in the replay container, every single-table
+  read is run on a small sample generated from the bundle's statistics, never from the
+  customer's data (the only customer text in it is the constants the workload's statements
+  bind): two hash prefixes (one per hash key value the workload binds, up to 8),
+  the primary key's range columns as a cross product sized by `pg_stats` distinct counts (8
+  when unknown) within a row budget per prefix, the values the queries bind present where the
+  sample can hold them (the review names any it cannot, `gen.literals`), other columns to
+  their distinct count and null fraction. Values come from the server's own types
+  (`generate.py`, algorithm A), each in the type's own text form; columns a foreign key or a
+  join condition links share values (B). The table keeps every constraint: a column's values
+  are first narrowed by its one-column CHECKs and partition bounds, evaluated by the server
+  (a foreign key's child then keeps only values its parent holds), and then each sample row
+  is the first of several candidates that satisfies the table's CHECKs, partition bounds and
+  foreign keys (C). A one-column CHECK no generated value satisfies is dropped; a table no
+  candidate row fits (a multi-column CHECK, say) is not measured. These, a predicate the
+  server cannot evaluate on candidates, a foreign key that closes a cycle, and rows lost to a
+  predicate are recorded in `gaps` (layers `gen.*`). The server then checks the round trip
+  (D): each fully loaded table's columns are counted (distinct values and NULLs, exactly, so
+  no statistics change the plans) and compared with the plan's (`gen.shape`); a measured plan
+  that uses a scan the replayed plan never chose is a plan flip (`gen.plan_flip`), whose
+  counters raise and explain nothing; a read that returns no row is `gen.empty`. Full-scale
+  statistics are injected after the load, when the bundle has them, so the planner chooses as
+  on the customer's table; the plan then runs with `EXPLAIN (ANALYZE, DIST, DEBUG)`. A read
+  that seeks far more than it asks for (about one seek per IN element or OR arm) or scans far
+  more rows than it returns is an anomaly; one no finding on that pattern explains becomes
+  MEAS001, "unexplained, measured", a lead rather than a diagnosis. Join reads and tables no
+  candidate row fits are not measured, and the review names them. Gap records are scrubbed
+  as they leave the engine: quoted constants, numbers and server-reported row values are
+  replaced (`server.scrub`).
+
 - **Fixpoint** (`yb-model.py fixpoint`, also run by `review`): starting from the review as
-  reported (its final findings and DDL, after replay and probes; disputed findings excluded),
-  apply every recommended DDL to a copy of the schema and review it again statically. Each
-  schema finding that carried DDL must be gone and no new schema finding at medium or above
-  may appear; a second round must add none either. Workload, plan and safety findings
-  describe the workload as measured and are not re-checked.
+  reported (after replay and probes), apply each finding's default modelled option, those
+  with a known cost included, to a model of the schema and review it again statically
+  (disputed findings are not offered, so their options are not applied). The re-runs are
+  static, so a finding that replay or a probe disputed or refuted is not counted as new when
+  it comes back, and a problem a costly option brings is reported with its cost. Options
+  are alternatives, so they are applied in batches that touch different objects. Each
+  finding must be gone after its batch, and no new schema finding at medium or above may
+  appear; a batch that adds one is re-run one option at a time to name it, and one that only
+  the combination brings is reported for the batch. Workload and plan findings describe the
+  workload as measured and are not re-checked.
 - **Planner oracle** (`evals/yb-model/oracle.py`, maintainer tool): generates hundreds of
   seeded schema and query cases, plans them on a real YugabyteDB with injected statistics,
   and compares the planner's choices with the engine's static model. Capability
@@ -267,27 +373,36 @@ says yes. When a broader input is missing, the narrower one is not listed again 
 pg_stat_statements implies no DocDB columns). Muting is applied in `analyze` regardless of the
 flag, so `analyze`, `review` and the fixpoint self-check all see the same rule set.
 
-## 9. Catalog mode (experimental)
+## 9. The catalog as the schema model
 
-`--catalog` builds the schema model from a scratch YugabyteDB the reviewer runs locally (Docker
-or Podman, a local `yugabytedb/yugabyte` image, never pulled), not from the DDL text. The
+Whenever a scratch server runs (replay, `--measure`; a review with no workload when the
+release and a local image are known; `--catalog` on its own), the
+schema model is read from a scratch YugabyteDB the reviewer runs locally (Docker or Podman, a
+local `yugabytedb/yugabyte` image, never pulled), not from the DDL text. The DDL text model
+serves only static-only reviews and is frozen (AGENTS.md). The
 bundle's DDL is loaded there and the model is read back from the catalog: key layouts
 (`pg_index.indoption`), the constraint behind each index, foreign keys, partitions and their
 attached indexes, colocation and tablegroups (`yb_table_properties`). Each index's canonical
 definition (`pg_get_indexdef`) goes through the ordinary CREATE INDEX reader. The rules are
 the same in both modes.
 
-- Every object is created with one tablet, so a large schema loads on one node; the declared
-  `SPLIT INTO n` counts are kept for the model.
-- When the server's errors show the dump is incomplete in a known way (a schema or a sequence
-  it never created, colocation ids from a colocated database), the gap is supplied and the
-  statements run again; each repair is listed in the review's notes.
-- A statement the server still rejects is listed, and its objects come from the DDL text.
+- With `--catalog` on its own, every object is created with one tablet, so a large schema
+  loads on one node. The replay database (the catalog on the server path) loads the DDL as
+  declared, with the master's tablet replica limit lifted. Either way the declared `SPLIT INTO
+  n` counts are kept for the model and counts the load chose are dropped.
+- One preparation (`catalog.prepare`) makes every scratch database (catalog, replay, measured
+  pass): when the server's errors show the dump is incomplete in a known way (a schema or a
+  sequence a column default names, colocation ids from a colocated database), the gap is
+  supplied and the statements run again; each repair is listed in the review.
+- A statement the server still rejects has no object in the model: it is listed with the
+  server's message, and a pattern that reads a table it would have made is listed as not
+  planned for that reason, not as a failing statement.
 - Nothing connects to a customer cluster.
 
 ## 10. What the engine does not do
 
-`pitfalls.md` lists the traps reviewers have met in practice and what to do about each.
+`pitfalls.md` lists the known gaps and the traps reviewers have met, each with the engine's
+status (`handled`, `flagged`, `not detected`), and what to do about each.
 
 - Measure latency or tablet sizes on the live cluster.
 - Judge client retry behaviour, CDC, retention, or erasure.

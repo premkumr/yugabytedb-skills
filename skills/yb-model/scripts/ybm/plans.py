@@ -65,12 +65,65 @@ def partial_hash_scan(scan, sch):
     if idx is None or not idx.hash_cols or not scan.get("index_cond"):
         return False
     cond = scan["index_cond"].lower()
-    return not all(re.search(r"\b%s\b" % re.escape(k.col), cond) for k in idx.hash_cols
+    return not all(re.search(r"\b%s\b" % re.escape(k.col.lower()), cond) for k in idx.hash_cols
                    if k.col)
 
 
 def _scans_for(facts, table):
     return [s for s in facts["scans"] if s["table"] == table]
+
+
+def image_relation(vm, image):
+    """How the replay image relates to the customer's release, for labels."""
+    from . import versions
+    newer = image and vm.get("customer") and versions.vt(image) > versions.vt(vm["customer"])
+    return ("a newer release than %s" if newer else "nearest earlier release to %s") % \
+        vm.get("customer")
+
+
+def standing(plans, rule):
+    """Whether a replay may confirm or refute `rule`, as one rule for every replay verdict:
+    {"usable", "why" (when not usable), "label" (a confirmation's confidence), "assumed"
+    (planner settings the bundle did not supply)}. On an image that is not the customer's
+    release, confirming or refuting needs the differences between the two releases; without
+    release facts they are unknown. A rule whose tested behaviour differs between the releases
+    is not settled by the image either."""
+    vm = plans.get("version_match") or {}
+    drift_unknown = not vm.get("exact", True) and not vm.get("drift_known", True)
+    image = vm.get("image_release") or plans.get("version")
+    assumed = sorted(plans.get("assumed_settings") or {})
+    label = "confirmed (replay)" if vm.get("exact", True) else \
+        "confirmed (replay on %s, %s)" % (image, image_relation(vm, image))
+    if assumed:
+        label += "; planner settings assumed"
+    if plans.get("statistics_missing"):
+        label += "; planned without %s" % " or ".join(plans["statistics_missing"])
+    why = None
+    if drift_unknown:
+        why = ("not used: replay ran on %s, not the customer's %s, and the differences between "
+               "the two releases are unknown (no release facts cached)" % (
+                   plans.get("version"), vm.get("customer")))
+    elif rule in set((vm.get("drift") or {}).get("rules", [])):
+        why = ("not used: this rule's tested behaviour differs between %s and the replay image "
+               "%s" % (vm.get("customer_release"), vm.get("image_release")))
+    return {"usable": why is None, "why": why, "label": label, "assumed": assumed}
+
+
+def _could_prune(pat, sch):
+    """True when `pat` filters a partitioned table it reads without binding every column of its
+    partition key (a predicate on the key would let the planner prune); True also when the
+    statement's shape is unknown."""
+    from . import sqlshape
+    if not pat or pat.get("shape") is None:
+        return True
+    for s in sqlshape.flatten(pat["shape"]):
+        for table in s.tables:
+            t = sch.tables.get(table)
+            preds = s.preds_for(table) if t is not None and t.partition_by else []
+            bound = {p.col for p in preds if p.op in ("eq", "in", "range", "prefix", "join")}
+            if preds and not set(t.partition_by[1]) <= bound:
+                return True
+    return False
 
 
 def reconcile(plans, patterns, col, sch, rules, th, recon, wshift, shift, Finding):
@@ -92,26 +145,27 @@ def reconcile(plans, patterns, col, sch, rules, th, recon, wshift, shift, Findin
             for s in f["scans"])
 
     vm = plans.get("version_match") or {}
-    drifted = set((vm.get("drift") or {}).get("rules", []))
-    # On an image that is not the customer's release, confirming or refuting needs the
-    # differences between the two releases. Without release facts they are unknown.
     drift_unknown = not vm.get("exact", True) and not vm.get("drift_known", True)
-    # Planner settings the bundle did not supply were assumed. A plan under assumed settings
-    # may confirm a finding, but never removes one: the finding moves to "disputed".
+    # Planner settings the bundle did not supply were assumed. Under assumed settings a
+    # verdict here (CAP010, CAP011, CAP030) may confirm a finding, but never removes one: the
+    # finding moves to "disputed". (Access-path findings follow the plan's access, labelled.)
     assumed = sorted(plans.get("assumed_settings") or {})
+    # Plans chosen without the customer's statistics are weak witnesses: they may agree with a
+    # finding (it stays probable) or dispute it, never confirm, remove or raise one.
+    weak = plans.get("statistics_missing") or []
     image = vm.get("image_release") or plans.get("version")
-    label = "confirmed (replay)" if vm.get("exact", True) else \
-        "confirmed (replay on %s, nearest earlier release to %s)" % (image, vm.get("customer"))
-    if assumed:
-        label += "; planner settings assumed"
     # What a replay on a different release shows without known differences is that release's
     # behaviour, not necessarily the customer's.
     caveat = "replayed on %s; differences to %s unknown" % (image, vm.get("customer")) \
         if drift_unknown else None
+    label = standing(plans, None)["label"]
     expect_seq = ("CAP001", "CAP002", "CAP003", "CAP040", "CAP031")
     for key in list(col.items.keys()):
         fnd = col.items[key]
-        if not fnd.rule.startswith("CAP") or not fnd.table:
+        # The access-path rules take their access from the plan itself (analyze.
+        # access_record): only the rules about what a plan does with the rows it reads (a
+        # sort, partitions appended) are judged here.
+        if fnd.rule not in ("CAP010", "CAP011", "CAP030") or not fnd.table:
             continue
         verdicts = []
         for pid in fnd.patterns:
@@ -143,25 +197,25 @@ def reconcile(plans, patterns, col, sch, rules, th, recon, wshift, shift, Findin
             verdicts.append((pid, ok, scans))
         if not verdicts:
             continue
-        if drift_unknown:
-            fnd.replay = ("not used: replay ran on %s, not the customer's %s, and the "
-                          "differences between the two releases are unknown (no release facts "
-                          "cached)" % (plans.get("version"), vm.get("customer")))
-            continue
-        if fnd.rule in drifted:
-            fnd.replay = ("not used: this rule's tested behaviour differs between %s and the "
-                          "replay image %s" % (vm.get("customer_release"),
-                                               vm.get("image_release")))
+        st = standing(plans, fnd.rule)
+        if not st["usable"]:
+            fnd.replay = st["why"]
             continue
         if any(v is True for _, v, _ in verdicts):
-            fnd.confidence = label
-            fnd.replay = "; ".join("%s: %s" % (pid, _scan_txt(sc)) for pid, v, sc in verdicts
-                                   if v is True)
+            agree = "; ".join("%s: %s" % (pid, _scan_txt(sc)) for pid, v, sc in verdicts
+                              if v is True)
+            if weak:
+                fnd.replay = "the replay agrees, but its plans were chosen without %s: %s" % (
+                    " or ".join(weak), agree)
+                continue
+            fnd.confidence = st["label"]
+            fnd.replay = agree
         elif all(v is False for _, v, _ in verdicts):
             plan_txt = "; ".join("%s: %s" % (pid, _scan_txt(sc)) for pid, _, sc in verdicts)
-            if assumed:
-                fnd.disputed = ("replay under assumed planner settings (%s) chose a plan that "
-                                "contradicts this finding: %s" % (", ".join(assumed), plan_txt))
+            if assumed or weak:
+                fnd.disputed = ("replay %s chose a plan that contradicts this finding: %s" % (
+                    "under assumed planner settings (%s)" % ", ".join(assumed) if assumed else
+                    "without %s" % " or ".join(weak), plan_txt))
                 fnd.replay = "disputed: " + plan_txt
                 continue
             recon.append({"finding": fnd.rule, "object": fnd.obj, "patterns": fnd.patterns,
@@ -173,7 +227,8 @@ def reconcile(plans, patterns, col, sch, rules, th, recon, wshift, shift, Findin
 
     # Plan-only findings. Each fires because no static finding predicted the plan, so its fix
     # says what the planner chose rather than pointing at a finding that does not exist.
-    for pid, facts in sorted(by_pat.items(), key=lambda kv: int(kv[0][1:])):
+    # Plan-only findings (PLN001-PLN003) need a plan chosen on the customer's statistics.
+    for pid, facts in sorted(() if weak else by_pat.items(), key=lambda kv: int(kv[0][1:])):
         w = weights.get(pid, "UNRANKED")
         for s in facts["scans"]:
             rows = rows_inj.get(s["relation"]) or rows_inj.get(s["table"])
@@ -196,7 +251,11 @@ def reconcile(plans, patterns, col, sch, rules, th, recon, wshift, shift, Findin
                             "%s sort" % pid, "%s: replayed plan sorts before LIMIT." % pid, [pid],
                             fix=_plan_fix("PLN002", pid, facts["scans"], col)))
         if facts["appends"] and max(facts["appends"]) > 1 and not any(
-                k[0] == "CAP030" and pid in v.patterns for k, v in col.items.items()):
+                k[0] == "CAP030" and pid in v.patterns for k, v in col.items.items()) and \
+                _could_prune(pats_by_id.get(pid), sch):
+            # A pattern that binds the partition key reads the partitions its own predicate
+            # spans (a range across two quarters appends two), and one that filters nothing on
+            # the table reads every partition by design: neither has anything left to prune.
             col.add(Finding("PLN003", shift("high", wshift[w]), label,
                             "%s append" % pid, "%s: replayed plan appends %d partitions." % (
                                 pid, max(facts["appends"])), [pid],
@@ -204,9 +263,13 @@ def reconcile(plans, patterns, col, sch, rules, th, recon, wshift, shift, Findin
     # Patterns the release rejected. Untyped parameters are a replay artefact (the application's
     # driver sends typed parameters), not a defect.
     artefacts = []
+    blocked = []  # patterns whose tables' DDL did not load: the input, not the statement
     for p in plans.get("patterns", []):
         err = (p.get("error") or "").split("ERROR:", 1)[-1].strip()
         if p.get("plan") or not err:
+            continue
+        if p.get("missing_tables"):
+            blocked.append("%s (%s)" % (p["id"], ", ".join(p["missing_tables"])))
             continue
         if re.search(r"could not determine data type of parameter|"
                      r"operator is not unique|inconsistent types deduced", err):
@@ -234,7 +297,11 @@ def reconcile(plans, patterns, col, sch, rules, th, recon, wshift, shift, Findin
             "probes": {k: {"verdict": v["verdict"], "detail": v["detail"]}
                        for k, v in (plans.get("probes") or {}).items()},
             "version_match": vm, "assumed_settings": plans.get("assumed_settings"),
+            "statistics_missing": weak,
             "ddl_errors": (plans.get("ddl_errors") or {}).get("count"),
+            "ddl_rejected": list((plans.get("ddl_errors") or {}).get("first") or [])[:10],
+            "repairs": list((plans.get("preparation") or {}).get("repairs") or []),
+            "blocked": blocked,
             "inject_errors": (plans.get("inject_errors") or {}).get("count"),
             "settings": plans.get("settings"), "errors": plans.get("errors", []),
             "planned": sorted(by_pat, key=lambda x: int(x[1:])),
@@ -250,10 +317,10 @@ def _scan_txt(scans):
 
 # The action of each plan-only finding: what to do about a plan nothing predicted.
 _PLAN_ACTION = {
-    "PLN001": "Check whether an index can serve this pattern's predicates.",
-    "PLN002": "Lead an index with the equality columns and follow with the ORDER BY columns in "
-              "the requested direction.",
-    "PLN003": "Add a predicate on the partition key so the planner can prune.",
+    "PLN001": "An index that serves this pattern's predicates would avoid this scan.",
+    "PLN002": "An index led by the equality columns, then the ORDER BY columns in the "
+              "requested direction, would return the rows in order without the sort.",
+    "PLN003": "A predicate on the partition key in the query would let the planner prune.",
 }
 # analyze.run folds these into the Measured line of the finding that shares their pattern and
 # drops them, so a fix that named one would point at a finding the report does not have.
@@ -274,11 +341,11 @@ def _scan_phrase(scans):
 
 
 def _plan_fix(rule, pid, scans, col):
-    """The fix of a plan-only finding: the action, what the planner did, then which other
+    """The fix of a plan-only finding: the reason, what the planner did, then which other
     findings the pattern has. The rules.json text can only say
     "see X", and X is by construction the finding that does not exist."""
     used = ("uses " + _scan_phrase(scans)) if scans else "has no scan of a named table"
-    # The action leads: the report's headline quotes a fix's first sentence as "First action".
+    # The reason leads: the report's headline quotes a fix's first sentence ("Start here").
     parts = [_PLAN_ACTION[rule], "No static finding predicted this: the replayed plan for %s "
                                  "%s." % (pid, used)]
     # Plan-only findings are left out: they are what is being explained, and the PLN001s of

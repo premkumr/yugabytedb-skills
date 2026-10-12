@@ -166,24 +166,28 @@ def _repairs(failed, ddl):
         if m:
             out.append('CREATE SCHEMA IF NOT EXISTS "%s";' % m.group(1))
         m = _NO_SEQ.search(err)
-        if m and "nextval" in stmt.lower() and m.group(1) in stmt:
+        if m and re.search(r"nextval\('(?:[^']*\.)?\"?%s\"?'" % re.escape(
+                m.group(1).split(".")[-1]), stmt):  # the sequence a default names, not
+            # any missing relation (a foreign key to a missing table is not a sequence)
             out.append("CREATE SEQUENCE IF NOT EXISTS %s;" % m.group(1))
     return sorted(set(out))
 
 
-def load(bundle, container, db, hash_default=True, colocated=False):
-    """Load the bundle's DDL into a new database `db`. Returns (seconds, [(text, error)] for
-    each statement the server rejected, {object: declared tablet count}, info). When the
-    server's errors show the dump is incomplete in a known way (a schema or sequence it never
-    created, or colocation ids from a colocated database), the gap is supplied and the
-    rejected statements run again; info["repairs"] says what was added."""
-    from .replay import strip_dump
-    ddl, declared = one_tablet(strip_dump(bundle.ddl))
-    head = "" if hash_default else "SET yb_use_hash_splitting_by_default = off;\n"
+def prepare(container, db, ddl, colocated=False, head=""):
+    """The one way a scratch database is made (catalog, replay, measured pass): create `db`,
+    load `ddl`, and when the server's errors show the dump is incomplete in a known way (a
+    schema or sequence it never created, or colocation ids from a colocated database), supply
+    the gap and run the rejected statements again. Returns ([(text, error)] for each statement
+    the server still rejects, info); info["repairs"] says what was added, info["colocated"]
+    what the database became. Raises when the database cannot be created: every later step
+    runs in it."""
     info = {"repairs": [], "colocated": bool(colocated)}
-    t0 = time.time()
-    container.sql("CREATE DATABASE %s WITH colocation = %s;" % (
+    container.sql("DROP DATABASE IF EXISTS %s;" % db, db="yugabyte")
+    r = container.sql("CREATE DATABASE %s WITH colocation = %s;" % (
         db, "true" if colocated else "false"), db="yugabyte")
+    if r.returncode != 0 or "ERROR" in (r.stderr or ""):
+        raise RuntimeError("could not create the scratch database %s: %s" % (
+            db, (r.stderr or r.stdout or "").strip()[:300]))
     failed = _run(container, db, head + ddl)
     if not colocated and any(_COLOCATED_DUMP in e for _, e in failed):
         # The dump carries colocation ids: it came from a colocated database.
@@ -201,6 +205,18 @@ def load(bundle, container, db, hash_default=True, colocated=False):
         failed = _run(container, db, head + "\n".join(fixes) + "\n" +
                       "".join(s.rstrip().rstrip(";") + ";\n" for s in retry))
         failed = [(s, e) for s, e in failed if s not in fixes]
+    return failed, info
+
+
+def load(bundle, container, db, hash_default=True, colocated=False):
+    """Load the bundle's DDL into a new database `db` (prepare), one tablet per table. Returns
+    (seconds, [(text, error)] for each statement the server rejected, {object: declared tablet
+    count}, info)."""
+    from .replay import strip_dump
+    ddl, declared = one_tablet(strip_dump(bundle.ddl))
+    head = "" if hash_default else "SET yb_use_hash_splitting_by_default = off;\n"
+    t0 = time.time()
+    failed, info = prepare(container, db, ddl, colocated, head)
     return time.time() - t0, failed, declared, info
 
 
@@ -212,11 +228,28 @@ def read(container, db):
     return json.loads(text)
 
 
+def annotated_as_written(sch, ddl):
+    """Whether each key column carried HASH/ASC/DESC in the DDL is a fact of the text, not of
+    the catalog (which always shows a layout): copy it, key by key, from the DDL as written for
+    every primary key and index the text declares the same way."""
+    try:
+        text = schema_mod.parse(ddl)
+    except Exception:  # the build's dump-wide flag stays
+        return
+    pairs = [(t.pk, text.tables[n].pk) for n, t in sch.tables.items()
+             if t.pk and n in text.tables and text.tables[n].pk]
+    pairs += [(i, text.indexes[n]) for n, i in sch.indexes.items() if n in text.indexes]
+    for got, written in pairs:
+        if len(got.keys) == len(written.keys):
+            for k, w in zip(got.keys, written.keys):
+                k.explicit = w.explicit
+
+
 def build(cat, explicit=True, failed=(), declared=None, hash_default=True):
     """A schema.Schema from the catalog document `cat`. `explicit` says whether the source DDL
     annotated its keys (a ysql_dump does); when it did not, the layouts are the scratch
     server's defaults and keep the 'sharding inferred' caveat. Objects whose statements the
-    server rejected come from the DDL text, as the text parser reads them."""
+    server rejected are not in it (they are listed as parse notes)."""
     sch = schema_mod.Schema()
     sch.db_colocated = bool(cat.get("db_colocated"))
     sch.hash_default = hash_default
@@ -266,10 +299,10 @@ def build(cat, explicit=True, failed=(), declared=None, hash_default=True):
         if idx is None or table not in sch.tables:
             continue
         n = (declared or {}).get(key)
-        if n and n > 1:  # loaded with one tablet; the DDL declared more
+        if n and n > 1:  # the DDL declared this count
             idx.split, idx.split_sql = "INTO %d" % n, "SPLIT INTO %d TABLETS" % n
-        elif idx.split == "INTO 1":  # one tablet: the load's setting, not a declared layout
-            idx.split = idx.split_sql = None
+        elif (idx.split or "").startswith("INTO"):  # a count the load chose (one tablet, or
+            idx.split = idx.split_sql = None       # the server's default): not declared
         idx.parent = rel_key(i.get("parent_schema") or i.get("schema"), i["parent"]) \
             if i.get("parent") else None
         for k in idx.keys:
@@ -288,29 +321,23 @@ def build(cat, explicit=True, failed=(), declared=None, hash_default=True):
             f["name"], rel_key(f.get("schema"), f["table"]), f.get("cols") or [],
             rel_key(f.get("ref_schema"), f["ref_table"]), f.get("ref_cols"),
             f.get("def")))
-    if failed:
-        text = schema_mod.parse("\n".join(s + ";" for s, _ in failed if s),
-                                db_colocated=sch.db_colocated, hash_default=hash_default)
-        for name, t in text.tables.items():
-            if name not in sch.tables:
-                sch.tables[name] = t
-        for name, idx in text.indexes.items():
-            if name not in sch.indexes and idx.table in sch.tables:
-                sch.indexes[name] = idx
-        for s, err in failed:
-            sch.parse_notes.append("the scratch server rejected a statement (%s); its objects "
-                                   "come from the DDL text: %s" % (err[:160], s[:120]))
+    # A statement the server rejects has no object: the model is the server's, and the
+    # rejection is reported, never filled in from the DDL text.
+    for s, err in failed:
+        sch.parse_notes.append("the scratch server rejected a statement (%s), so its objects "
+                               "are not in the model: %s" % (err[:160], s[:120]))
     sch.resolve_modes()
     return sch
 
 
-def attach(bundle, image=None, container=None, db="ybm_catalog"):
+def attach(bundle, image=None, container=None, db="ybm_catalog", loaded=None):
     """Build the schema from a scratch server and keep it on the bundle (bundle.catalog_schema,
-    bundle.catalog_info), so every pass of the review uses it."""
+    bundle.catalog_info), so every pass of the review uses it. `loaded`: read the database
+    `db` the caller already prepared (schema_for)."""
     from . import analyze, replay
     hash_default = analyze.planner_settings(bundle)["hash_default"]
     if container is not None:
-        sch, info = schema_for(bundle, container, db, hash_default=hash_default)
+        sch, info = schema_for(bundle, container, db, hash_default=hash_default, loaded=loaded)
     else:
         img = image or replay.find_image(bundle.version)[0] or replay.find_image(None)[0]
         if not img:
@@ -324,17 +351,25 @@ def attach(bundle, image=None, container=None, db="ybm_catalog"):
     return sch, info
 
 
-def schema_for(bundle, container, db, hash_default=True, colocated=None):
-    """Load, read and build; also returns timing and the rejected statements."""
+def schema_for(bundle, container, db, hash_default=True, colocated=None, loaded=None):
+    """Load, read and build; also returns timing and the rejected statements. With `loaded`
+    ((rejected statements, preparation info) of a database already prepared from the bundle's
+    DDL as written, as replay's), the catalog is read from that database: one load."""
     from . import preflight
-    if colocated is None:
-        colocated = _truthy(bundle.meta.get("colocated", ""))
-    secs, failed, declared, loaded = load(bundle, container, db, hash_default=hash_default,
-                                          colocated=colocated)
+    from .replay import strip_dump
+    if loaded is not None:
+        secs, (failed, loaded) = 0.0, loaded
+        declared = one_tablet(strip_dump(bundle.ddl))[1]
+    else:
+        if colocated is None:
+            colocated = _truthy(bundle.meta.get("colocated", ""))
+        secs, failed, declared, loaded = load(bundle, container, db, hash_default=hash_default,
+                                              colocated=colocated)
     t0 = time.time()
     cat = read(container, db)
     sch = build(cat, explicit=preflight._yb_metadata(bundle), failed=failed, declared=declared,
                 hash_default=hash_default)
+    annotated_as_written(sch, bundle.ddl)
     for r in loaded["repairs"]:
         sch.parse_notes.append("the dump was incomplete; added on the scratch server: " + r)
     return sch, {"load_seconds": round(secs, 1), "read_seconds": round(time.time() - t0, 1),

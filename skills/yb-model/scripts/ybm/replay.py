@@ -16,6 +16,7 @@ import tempfile
 import time
 
 from . import analyze as an
+from . import sqlshape
 from .schema import qi, qn, split_key
 
 INJECT_FN = r"""
@@ -96,10 +97,10 @@ def _sh(cmd, inp=None, timeout=600):
 
 def find_image(version, image=None):
     """(image, exact). Exact release first; otherwise the newest image of the same release
-    line (major.minor) that is older than the customer's release, whose differences
-    reconcile() then accounts for. Never a newer image (a newer planner may already fix what
-    the customer's release still does) and never across lines unless the caller names the
-    image."""
+    line (major.minor) at or below the customer's release (closest code), else the oldest newer
+    one of that line. A non-exact image's differences from the customer's release are applied
+    through plans.standing (unknown differences confirm nothing) and the labels say whether it
+    is earlier or newer. Never across lines unless the caller names the image."""
     from . import versions
     if image:
         tag = image.split(":")[-1].split("-")[0]
@@ -116,13 +117,14 @@ def find_image(version, image=None):
         return exact[-1], True
     same = [t for t in tags if versions.line(t.split(":")[1]) == versions.line(version)]
     if same:
-        # The newest image at or below the customer's release (closest code), else the oldest
-        # above it.
+        # The newest image at or below the customer's release (closest code). An image above
+        # it is not used: it may have planner behaviour the customer's release lacks.
         want = versions.vt(version)
         below = [t for t in same if versions.vt(t.split(":")[1]) <= want]
         if below:
             return below[-1], False
-        return None, False
+        # Otherwise the oldest newer image of the line: labelled as a newer release, and its
+        # differences from the customer's release (or that they are unknown) are reported.
         return same[0], False
     return None, False
 
@@ -142,6 +144,17 @@ def strip_dump(ddl):
             continue
         out.append(line)
     return "\n".join(out)
+
+
+def not_loaded(pattern, have):
+    """The tables `pattern`'s statement names (as the SQL reader resolves them, before they are
+    matched to the schema, which holds only what loaded) that are not among the loaded
+    relations `have` (schema-qualified, lower case); [] when `have` is unknown."""
+    if have is None:
+        return []
+    named = sorted({t for s in sqlshape.flatten(pattern["shape"]) for t in s.tables}) \
+        if pattern.get("shape") is not None else pattern.get("tables") or []
+    return [t for t in named if ("." in t and t.lower() or "public." + t.lower()) not in have]
 
 
 def build_inject_sql(bundle, sch):
@@ -241,8 +254,9 @@ def nparams(q):
 
 def patterns_sql(patterns, outdir):
     lines = ["\\pset format unaligned", "\\pset tuples_only on"]
+    from . import server
     for p in patterns:
-        q = p["query"].strip().rstrip(";")
+        q, _ = server.statement(p["query"])  # what the server can prepare
         n = nparams(q)
         name = "ybm_%s" % p["id"].lower()
         lines.append("\\echo ===YBM %s" % p["id"])
@@ -250,6 +264,11 @@ def patterns_sql(patterns, outdir):
         if n:
             lines.append("PREPARE %s AS %s;" % (name, q))
             lines.append("EXPLAIN (VERBOSE, FORMAT JSON) EXECUTE %s(%s);" % (name, ", ".join(["NULL"] * n)))
+            # The server's type for each $n (server.py reads which column each one binds).
+            lines.append("\\o %s/%s.types" % (outdir, p["id"]))
+            lines.append("SELECT parameter_types FROM pg_prepared_statements WHERE name = '%s';"
+                         % name)
+            lines.append("\\o")
             lines.append("DEALLOCATE %s;" % name)
         else:
             lines.append("EXPLAIN (VERBOSE, FORMAT JSON) %s;" % q)
@@ -260,6 +279,7 @@ def patterns_sql(patterns, outdir):
 class Container:
     def __init__(self, image, name, keep=False, master_flags=None, tserver_flags=None):
         self.image, self.name, self.keep = image, name, keep
+        self.master_flags = master_flags
         self.start = ["bin/yugabyted", "start", "--background=false", "--ui=false"]
         if master_flags:
             self.start.append("--master_flags=" + master_flags)
@@ -276,8 +296,19 @@ class Container:
         for _ in range(100):
             r = self.sql("SELECT 1", db="yugabyte")
             if r.returncode == 0:
+                # yugabyted does not pass every --master_flags entry to the master (the
+                # tablet-replica limit stays on): set them on the running master too.
+                for kv in (self.master_flags or "").split(","):
+                    if "=" in kv:
+                        k, v = kv.split("=", 1)
+                        _sh(["docker", "exec", self.name, "bash", "-c",
+                             'bin/yb-ts-cli --server_address="$(hostname):7100" set_flag '
+                             '--force %s %s' % (k.strip(), v.strip())])
                 return self
             time.sleep(3)
+        # __exit__ never runs when __enter__ raises: remove the container here.
+        if not self.keep:
+            _sh(["docker", "rm", "-f", self.name])
         raise RuntimeError("YugabyteDB did not become ready in the container")
 
     def __exit__(self, *a):
@@ -296,19 +327,128 @@ class Container:
                     'bin/ysqlsh -h "$(hostname)" -X -q -v ON_ERROR_STOP=0 -d %s -f %s 2>&1'
                     % (db, remote)], timeout=1800)
 
+    def mkdir(self, remote):
+        _sh(["docker", "exec", self.name, "mkdir", "-p", remote])
+
+    def copy_out(self, remote, local):
+        _sh(["docker", "cp", "%s:%s" % (self.name, remote), local])
+
+
+class Recorder:
+    """A container that writes every call and its answer to `path` (JSON) on exit: the answers
+    a Recorded container serves offline (YBM_RECORD=path)."""
+
+    def __init__(self, inner, path):
+        self.inner, self.path, self.calls = inner, path, []
+        self.name = inner.name
+
+    def __enter__(self):
+        self.inner.__enter__()
+        return self
+
+    def __exit__(self, *a):
+        try:
+            with open(self.path, "w", encoding="utf-8") as fh:
+                json.dump({"calls": self.calls}, fh, indent=0, sort_keys=True)
+        finally:  # the container goes whatever happens to the recording
+            ret = self.inner.__exit__(*a)
+        return ret
+
+    def _log(self, key, r):
+        self.calls.append(dict(key, stdout=r.stdout, stderr=r.stderr, rc=r.returncode))
+        return r
+
+    def sql(self, text, db="ybm", flags=()):
+        return self._log({"call": "sql", "db": db, "flags": list(flags), "text": text},
+                         self.inner.sql(text, db=db, flags=flags))
+
+    def file_sql(self, local_path, db="ybm"):
+        with open(local_path, encoding="utf-8") as fh:
+            text = fh.read()
+        return self._log({"call": "file_sql", "db": db, "flags": [], "text": text},
+                         self.inner.file_sql(local_path, db=db))
+
+    def mkdir(self, remote):
+        self.inner.mkdir(remote)
+
+    def copy_out(self, remote, local):
+        self.inner.copy_out(remote, local)
+        files = {}
+        for root, _, names in os.walk(local):
+            for n in sorted(names):
+                with open(os.path.join(root, n), encoding="utf-8") as fh:
+                    files[os.path.relpath(os.path.join(root, n), local)] = fh.read()
+        self.calls.append({"call": "copy_out", "db": "", "flags": [], "text": remote,
+                           "files": files})
+
+
+class Recorded:
+    """Serves a Recorder's answers in place of a container: each call gets the next answer
+    recorded for the same call. A call that was never recorded raises: the SQL the engine
+    sends has changed, and the recording must be made again on a live server."""
+
+    def __init__(self, path):
+        with open(path, encoding="utf-8") as fh:
+            calls = json.load(fh)["calls"]
+        self.answers, self.name = {}, "recorded"
+        for c in calls:
+            self.answers.setdefault((c["call"], c["db"], tuple(c["flags"]), c["text"]),
+                                    []).append(c)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def _next(self, key):
+        q = self.answers.get(key)
+        if not q:
+            raise KeyError("call not in the recording (record it again): %s %s %.200s" % (
+                key[0], key[1], key[3]))
+        return q.pop(0) if len(q) > 1 else q[0]
+
+    def sql(self, text, db="ybm", flags=()):
+        c = self._next(("sql", db, tuple(flags), text))
+        return subprocess.CompletedProcess([], c["rc"], c["stdout"], c["stderr"])
+
+    def file_sql(self, local_path, db="ybm"):
+        with open(local_path, encoding="utf-8") as fh:
+            c = self._next(("file_sql", db, (), fh.read()))
+        return subprocess.CompletedProcess([], c["rc"], c["stdout"], c["stderr"])
+
+    def mkdir(self, remote):
+        pass
+
+    def copy_out(self, remote, local):
+        c = self._next(("copy_out", "", (), remote))
+        for rel, text in c["files"].items():
+            os.makedirs(os.path.dirname(os.path.join(local, rel)), exist_ok=True)
+            with open(os.path.join(local, rel), "w", encoding="utf-8") as fh:
+                fh.write(text)
+
 
 def _errors(text, limit=50):
     errs = [l.strip() for l in text.splitlines() if "ERROR:" in l]
     return errs[:limit], len(errs)
 
 
-def run(bundle, image=None, mode="customer", keep=False, max_patterns=200, probe_rules=()):
-    ps = an.planner_settings(bundle)
+def _patterns(bundle, max_patterns):
     sch = an.build_schema(bundle)
     pats = an.build_patterns(bundle, sch)
     # The top ranked patterns, and every listed one (unranked, so possibly hot).
-    patterns = pats[:max_patterns] + [p for p in pats[max_patterns:]
-                                      if p["source"] == "queries.sql"]
+    return sch, pats[:max_patterns] + [p for p in pats[max_patterns:]
+                                       if p["source"] == "queries.sql"]
+
+
+def run(bundle, image=None, mode="customer", keep=False, max_patterns=200, probe_rules=(),
+        measure=False, catalog=False):
+    """Replay the bundle's patterns on a scratch server. catalog: read the schema model from
+    the replay's own database (bundle.catalog_schema), before the patterns are built.
+    probe_rules: rule ids, or a function of the bundle (called once the schema is read)."""
+    ps = an.planner_settings(bundle)
+    # With the catalog, the schema and patterns are built once it is read (in the container).
+    sch, patterns = (None, None) if catalog else _patterns(bundle, max_patterns)
     from . import versions
     img, exact = find_image(bundle.version, image)
     if not img:
@@ -330,18 +470,69 @@ def run(bundle, image=None, mode="customer", keep=False, max_patterns=200, probe
                                 "drift": versions.drift(cust_tag, img_tag, rules=rule_ids)},
               "assumed_settings": {}}
     try:
-        with Container(img, "ybm-replay-%d" % os.getpid(), keep=keep) as c:
-            coloc = "true" if ps["colocated"] else "false"
-            r = c.sql("CREATE DATABASE ybm WITH colocation = %s;" % coloc, db="yugabyte")
+        # The tablet-replica limit of a one-node scratch cluster is the environment, not the
+        # customer's DDL: lifted, as for the catalog, so SPLIT INTO clauses load as written.
+        box = Container(img, "ybm-replay-%d" % os.getpid(), keep=keep,
+                        master_flags="enforce_tablet_replica_limits=false")
+        if os.environ.get("YBM_RECORD"):
+            box = Recorder(box, os.environ["YBM_RECORD"])
+        with box as c:
+            from . import catalog as catalog_mod
+            ddl_sql = strip_dump(bundle.ddl)
+            # The customer's sharding default for keys the DDL does not annotate.
+            head = "" if ps["hash_default"] else "SET yb_use_hash_splitting_by_default = off;\n"
+            try:  # the same preparation as the catalog's (and the measured pass's)
+                failed, prep = catalog_mod.prepare(c, "ybm", ddl_sql, ps["colocated"], head)
+            except RuntimeError as e:
+                # Every later step runs in this database; without it each would fail with a
+                # FATAL that names no cause.
+                raise RuntimeError(str(e).replace("the scratch database ybm",
+                                                  "the replay database"))
             result["server_version"] = c.sql("SELECT version();", flags=("-tA",)).stdout.strip()
-            ddl_path = os.path.join(work, "ddl.sql")
-            with open(ddl_path, "w") as fh:
-                fh.write(strip_dump(bundle.ddl))
-            out = c.file_sql(ddl_path).stdout
-            errs, n = _errors(out)
-            result["ddl_errors"] = {"count": n, "first": errs}
+            result["preparation"] = prep
+            result["ddl_errors"] = {"count": len(failed),
+                                    "first": [e for _, e in failed][:50]}
+            if catalog and getattr(bundle, "catalog_schema", None) is None:
+                # One load: the catalog is read from this database, then the patterns are
+                # built on the server's schema.
+                try:
+                    catalog_mod.attach(bundle, container=c, db="ybm", loaded=(failed, prep))
+                    bundle.catalog_info["image"] = img
+                except Exception as e:
+                    result["catalog_error"] = str(e)[:300]
+            if sch is None:
+                sch, patterns = _patterns(bundle, max_patterns)
+            if callable(probe_rules):
+                probe_rules = probe_rules(bundle)
+            # The tables the scratch database has: a pattern that reads one it lacks fails
+            # because its DDL did not load, not because of the statement.
+            q = c.sql("SELECT json_agg(json_build_array(lower(n.nspname || '.' || c.relname), "
+                      "c.relkind)) FROM pg_class c "
+                      "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN "
+                      "('r', 'p', 'v', 'm', 'f') AND n.nspname NOT IN ('pg_catalog', "
+                      "'information_schema') AND n.nspname NOT LIKE 'pg\\_%';", flags=("-tA",))
+            try:
+                rels = json.loads((q.stdout or "").strip() or "[]") or []
+                have = {n for n, _ in rels}
+            except ValueError:
+                rels, have = [], None
+            # Tables, as the catalog counts them (views are readable, not tables).
+            result["tables_loaded"] = sum(1 for _, k in rels if k in ("r", "p")) \
+                if have is not None else None
+            q = c.sql("SELECT count(*) FROM pg_index i JOIN pg_class t ON t.oid = i.indrelid "
+                      "JOIN pg_namespace n ON n.oid = t.relnamespace WHERE NOT i.indisprimary "
+                      "AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND "
+                      "n.nspname NOT LIKE 'pg\\_%';", flags=("-tA",))
+            try:
+                result["indexes_loaded"] = int((q.stdout or "").strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                result["indexes_loaded"] = None
             inj, rel = build_inject_sql(bundle, sch)
             result["reltuples"] = rel
+            # Plans chosen without these are a weaker witness; the label on every replay
+            # confirmation says so (plans.standing).
+            result["statistics_missing"] = [x for x, have in (
+                ("column statistics", bundle.stats), ("table sizes", rel)) if not have]
             inj_path = os.path.join(work, "inject.sql")
             with open(inj_path, "w") as fh:
                 fh.write(inj)
@@ -365,7 +556,7 @@ def run(bundle, image=None, mode="customer", keep=False, max_patterns=200, probe
             pq = os.path.join(work, "patterns.sql")
             with open(pq, "w") as fh:
                 fh.write(set_sql + patterns_sql(patterns, remote_out))
-            _sh(["docker", "exec", c.name, "mkdir", "-p", remote_out])
+            c.mkdir(remote_out)
             out = c.file_sql(pq).stdout
             result["settings_notices"] = [l.strip() for l in out.splitlines()
                                           if "not applied" in l]
@@ -377,10 +568,13 @@ def run(bundle, image=None, mode="customer", keep=False, max_patterns=200, probe
                 elif "ERROR:" in line and cur:
                     perr.setdefault(cur, line.strip())
             local_plans = os.path.join(work, "plans")
-            _sh(["docker", "cp", "%s:%s" % (c.name, remote_out), local_plans])
+            c.copy_out(remote_out, local_plans)
             for p in patterns:
                 entry = {"id": p["id"], "query": p["query"], "plan": None,
                          "error": perr.get(p["id"])}
+                missing = not_loaded(p, have)
+                if entry["error"] and missing:
+                    entry["missing_tables"] = missing  # its DDL did not load
                 fp = os.path.join(local_plans, "%s.json" % p["id"])
                 if os.path.isfile(fp):
                     with open(fp, encoding="utf-8") as fh:
@@ -390,11 +584,22 @@ def run(bundle, image=None, mode="customer", keep=False, max_patterns=200, probe
                             entry["plan"] = json.loads(txt)
                         except ValueError:
                             entry["error"] = entry["error"] or "unparseable EXPLAIN output"
+                tp = os.path.join(local_plans, "%s.types" % p["id"])
+                if os.path.isfile(tp):
+                    with open(tp, encoding="utf-8") as fh:
+                        raw = fh.read().strip().strip("{}")
+                    entry["param_types"] = [x.strip().strip('"') for x in
+                                            re.findall(r'"[^"]*"|[^,]+', raw)] if raw else []
                 result["patterns"].append(entry)
             result["version"] = img.split(":")[-1]
             if probe_rules:
                 from . import probes
                 result["probes"] = probes.run(c, probe_rules, set_sql)
+            if measure:
+                from . import measure as measure_mod
+                result["measured"] = measure_mod.run(c, bundle, sch, patterns, set_sql, inj,
+                                                     ddl_sql, replayed=result["patterns"],
+                                                     colocated=prep["colocated"], head=head)
     finally:
         shutil.rmtree(work, ignore_errors=True)
     return result

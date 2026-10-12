@@ -13,8 +13,9 @@ query and compares with what ybm predicts:
     - engine: index order suffices planner: Sort
     - engine: needs a Sort         planner: no Sort, rows still ordered
     - engine: not covering         planner: Index Only Scan
+    - engine: a column bound after a key gap  planner: it is not in the Index Cond
   cost choices (counted, not errors): planner prefers a scan or another index the engine
-  also considered usable.
+  also considered usable. key-gap (counted): the planner skip-scans the gap as predicted.
 
 Writes oracle-report.json next to this file and prints a summary with counterexamples.
 """
@@ -23,6 +24,7 @@ import argparse
 import json
 import os
 import random
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -34,13 +36,16 @@ from ybm import analyze, replay, safety, schema, sqlshape  # noqa: E402
 PKS = ["PRIMARY KEY (id HASH)",
        "PRIMARY KEY ((a, b) HASH, id ASC)",
        "PRIMARY KEY (id ASC)",
-       "PRIMARY KEY (a HASH, d DESC, id ASC)"]
+       "PRIMARY KEY (a HASH, d DESC, id ASC)",
+       "PRIMARY KEY (a HASH, b ASC, e ASC, id ASC)"]
 INDEXES = ["(a HASH)", "(b HASH, d DESC)", "(d ASC)", "(a HASH) INCLUDE (c)",
            "(b HASH) WHERE b IS NOT NULL", "((lower(c)) HASH)", "(a HASH, b ASC)",
            "(e ASC, a ASC)", "((a, e) HASH)"]
 WHERES = ["a = $1", "a = $1 AND b = $2", "a IN ($1, $2, $3)", "b > $1", "d > $1",
           "lower(c) = $1", "c = $1", "a = $1 OR b = $2", "id = $1", "e = $1",
-          "a = $1 AND e = $2", "b = $1", "a = $1 AND d > $2", "e > $1 AND a = $2"]
+          "a = $1 AND e = $2", "b = $1", "a = $1 AND d > $2", "e > $1 AND a = $2",
+          # key gaps (CAP014): a later key column bound after an unbound one
+          "a = $1 AND id = $2", "a = $1 AND b = $2 AND id = $3", "a = $1 AND e = $2 AND id = $3"]
 ORDERS = ["", "", " ORDER BY d DESC LIMIT 10", " ORDER BY id LIMIT 10", " ORDER BY b LIMIT 10"]
 COLS = ["*", "id", "a, c", "a, b"]
 BATCH = 120
@@ -157,6 +162,17 @@ def compare(case, pred, shape, info):
         if not pred["covering"] and info["node"] == "Index Only Scan":
             out.append(("capability", "engine: %s not covering; planner Index Only Scan"
                         % pred["path"]))
+    if pred["path"] and idx_scan and info["index"] == pred["path"] and pred.get("after_gap"):
+        cond = (info["index_cond"] or "").lower()
+        missing = [c for c in pred["after_gap"]
+                   if not re.search(r"\b%s\b" % re.escape(c.lower()), cond)]
+        if missing:
+            out.append(("capability", "engine: %s bound after the gap (%s) in %s; planner "
+                        "filters it" % (", ".join(missing), ", ".join(pred["gap"]),
+                                        pred["path"])))
+        else:
+            out.append(("key-gap", "planner seeks %s after the gap (%s) in %s" % (
+                ", ".join(pred["after_gap"]), ", ".join(pred["gap"]), pred["path"])))
     if pred["path"] and not idx_scan:
         out.append(("cost", "engine: %s usable; planner chose %s" % (pred["path"], info["node"])))
     elif pred["path"] and info["index"] and info["index"] != pred["path"]:
@@ -220,6 +236,12 @@ def record(img, cbo, seed, cases, results, cap, kinds, probe):
                            "(%s read requests)" % (probe["rows_scanned"], probe["table_rows"],
                                                    probe["rows_returned"],
                                                    probe["read_requests"])})
+    gaps = sum(1 for r in results for k, _ in r.get("diffs", []) if k == "key-gap")
+    if gaps:
+        rules.setdefault("CAP014", []).append({
+            "release": release, "mode": cbo,
+            "observation": "planner put the column bound after a key gap in the Index Cond "
+                           "(a skip scan) in %d of %d generated cases" % (gaps, len(cases))})
     if walks:
         rules.setdefault("CAP012", []).append({
             "release": release, "mode": cbo,

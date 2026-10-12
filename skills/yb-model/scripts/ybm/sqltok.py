@@ -245,18 +245,21 @@ def expr_of(toks):
 
 
 def text_of(toks, quote=False):
-    """Normalised text of a token run, used to compare expressions."""
-    out = []
+    """Normalised text of a token run, used to compare expressions. Spacing around punctuation
+    is normalised outside string literals and quoted names only: ', ' and "a, b" keep theirs,
+    so the text still means the same value when it is written into DDL."""
+    out, kept = [], []
     for t in toks:
         if t.kind == "word":
             out.append(t.text.lower())
-        elif t.kind == "qident":
-            out.append(qi(t.ident) if quote else t.ident)
+        elif t.kind in ("qident", "str"):
+            kept.append(t.text if t.kind == "str" else (qi(t.ident) if quote else t.ident))
+            out.append("\x00%d\x00" % (len(kept) - 1))
         else:
             out.append(t.text)
     s = " ".join(out)
     s = re.sub(r"\s*([().,:\[\]])\s*", r"\1", s)
-    return s
+    return re.sub(r"\x00(\d+)\x00", lambda m: kept[int(m.group(1))], s)
 
 
 def is_word(t, *words):

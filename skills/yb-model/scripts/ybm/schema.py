@@ -24,6 +24,22 @@ def key_group(cols, colocated, hashed=1):
     return ", ".join(["(%s) HASH" % ", ".join(cols[:n])] + ["%s ASC" % c for c in cols[n:]])
 
 
+def new_index_sql(sch, name, table, keys, unique=False, include=(), note=None):
+    """CREATE INDEX for a new index (not a replacement: index_sql derives those). A partitioned
+    table builds without CONCURRENTLY (its parent cannot build one concurrently), and a unique
+    index there must contain the partition key; without it there is no valid statement, so
+    None. keys: the key list as SQL."""
+    t = sch.tables.get(table)
+    part = t.partition_by if t is not None else None
+    if unique and part and not all(re.search(r"(?<![\w\"])%s(?![\w\"])" % re.escape(qi(c)), keys)
+                                   for c in part[1]):
+        return None
+    return "CREATE %sINDEX %s%s ON %s (%s)%s;%s" % (
+        "UNIQUE " if unique else "", "" if part else "CONCURRENTLY ", qi(ident(bare(name))),
+        qn(table), keys, (" INCLUDE (%s)" % ", ".join(qi(c) for c in include)) if include else "",
+        ("  -- " + note) if note else "")
+
+
 def ident(name):
     """A generated identifier that fits the 63-byte limit: a longer one keeps a stable hash
     suffix instead of being cut by the server (which could collide with an existing name)."""
@@ -105,7 +121,7 @@ class KeyCol:
 class Index:
     def __init__(self, name, table, keys, unique=False, include=None, where=None,
                  split=None, is_pk=False, method="lsm", line=0, split_sql=None, where_sql=None,
-                 constraint=False, nulls_not_distinct=False):
+                 constraint=False, nulls_not_distinct=False, parent=None):
         self.name = name
         self.table = table
         self.keys = keys
@@ -120,6 +136,7 @@ class Index:
         self.where_sql = where_sql  # the predicate exactly as written, or None
         self.constraint = constraint  # backs a UNIQUE constraint: dropped with ALTER TABLE
         self.nulls_not_distinct = nulls_not_distinct  # UNIQUE ... NULLS NOT DISTINCT
+        self.parent = parent  # partitioned index this is a partition's copy of (ATTACH)
 
     @property
     def hash_cols(self):
@@ -199,6 +216,8 @@ class Schema:
         self.parse_notes = []
         self.search_path = ["public"]  # schemas an unqualified name in a query is looked up in
         self.ambiguous = {}  # unqualified name -> (chosen key, [other keys]) seen in queries
+        self.unresolved = {}  # unqualified name -> [keys]: several schemas, none on the path
+        self.off_path = {}  # unqualified name -> key: one schema defines it, off the path
 
     # --- lookups -------------------------------------------------------------
     def table(self, name):
@@ -207,7 +226,10 @@ class Schema:
     def rel(self, qual, name):
         """The key of the table a query names: as qualified, else the first schema on the
         search path that has it (as the server resolves it), else the one schema that has it.
-        A name that several schemas define is recorded in self.ambiguous."""
+        A name that several schemas define is recorded in self.ambiguous. One that only schemas
+        off the search path define is recorded too: with one such schema it is read as that
+        schema's table (self.off_path), with several it resolves to no table (self.unresolved)
+        and returns a name that is never a table's key, so its statements are left out."""
         if qual:
             return rel_key(qual, name)
         same = sorted(k for k in self.tables if split_key(k)[1] == name)
@@ -215,7 +237,11 @@ class Schema:
                     if rel_key(s, name) in self.tables), None)
         if hit is None and len(same) == 1:
             hit = same[0]
+            self.off_path[name] = hit
         if hit is None:
+            if len(same) > 1:
+                self.unresolved[name] = same
+                return "?" + name  # not a key: the server would not find it either
             return name
         if len(same) > 1:
             self.ambiguous[name] = (hit, [k for k in same if k != hit])
@@ -643,6 +669,21 @@ def _parse_create_index(st, schema, line, sql=None):
                                   where_sql=where_sql, nulls_not_distinct=nnd)
 
 
+def _parse_alter_index(st, schema):
+    """ALTER INDEX parent ATTACH PARTITION child: ysql_dump's way of saying that child is a
+    partition's copy of partitioned index parent (YSQL changes it only through the parent)."""
+    i = _skip_words(st, 2, "IF", "EXISTS", "ONLY")
+    parent, i = _name(st, i)
+    k = _find_top(st, "ATTACH", i)
+    if not parent or k == -1 or k + 1 >= len(st) or not is_word(st[k + 1], "PARTITION"):
+        return
+    child, _ = _name(st, k + 2)
+    idx = schema.indexes.get(child) or next(
+        (t.pk for t in schema.tables.values() if t.pk is not None and t.pk.name == child), None)
+    if idx is not None and child != parent:
+        idx.parent = parent
+
+
 def _parse_alter_table(st, schema, line, sql=None):
     i = 2
     i = _skip_words(st, i, "IF", "EXISTS", "ONLY")
@@ -734,6 +775,8 @@ def parse(sql, db_colocated=None, hash_default=True):
                     _parse_create_index(st, schema, line, sql)
             elif is_word(st[0], "ALTER") and len(st) > 1 and is_word(st[1], "TABLE"):
                 _parse_alter_table(st, schema, line, sql)
+            elif is_word(st[0], "ALTER") and len(st) > 1 and is_word(st[1], "INDEX"):
+                _parse_alter_index(st, schema)
         except IndexError:
             schema.parse_notes.append("could not parse statement at line %d" % line)
     if db_colocated is not None:

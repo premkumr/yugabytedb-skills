@@ -9,7 +9,7 @@
    "mutes": ["CAP001", "CAP002", "CAP003", "CAP010", "CAP011", "CAP012", "CAP020", "CAP021",
              "CAP030", "CAP031", "CAP040", "CAP050", "CAP051", "IDX001", "PLN001", "PLN002",
              "PLN003", "PLN004", "WRK001", "WRK002", "WRK004", "WRK005", "WRK006", "WRK007",
-             "WRK008", "WRK009", "WRK010", "CAP013", "CAP060", "PLN005"],
+             "WRK008", "WRK009", "WRK010", "CAP013", "CAP014", "CAP060", "PLN005"],
    "stages": ["plan replay", "access-pattern table", "plan-regression part of the safety pass (uniqueness is still checked)", "workload hygiene section"],
    "collect": "ysqlsh -f scripts/collect.sql (writes ybm_pss.csv), or paste the application's queries"
   },
@@ -22,7 +22,7 @@
    "mutes": ["CAP050", "CAP051", "IDX001", "WRK001", "WRK002", "WRK004", "WRK005", "WRK006",
              "WRK007", "WRK008", "WRK009", "WRK010"],
    "weakens": {"rules": ["CAP001", "CAP002", "CAP003", "CAP010", "CAP011", "CAP012", "CAP013",
-                         "CAP020", "CAP021", "CAP030", "CAP031", "CAP040"],
+                         "CAP014", "CAP020", "CAP021", "CAP030", "CAP031", "CAP040"],
                "caveat": "pattern unranked"},
    "stages": ["traffic weighting (HOT / WARM / COLD)", "drop instead of rebuild for unused indexes", "workload hygiene section"],
    "if_declared_complete": {"unmute": ["IDX001"], "caveat": "workload declared complete",
@@ -35,7 +35,7 @@
    "label": "Column statistics: pg_stats (ybm_pg_stats.csv)",
    "without": "Null fraction, distinct counts, skew and correlation of key columns are unknown, so hot-shard and data-quality checks cannot run; nullability comes from the DDL only.",
    "mutes": ["STA002", "STA003", "STA005", "STA006", "STA007", "CFG005"],
-   "weakens": {"rules": ["STA001", "STA004"], "caveat": "no pg_stats"},
+   "weakens": {"rules": ["CAP014", "STA001", "STA004", "MEAS001"], "caveat": "no pg_stats"},
    "stages": ["'already sound' statements about key distribution"],
    "collect": "ysqlsh -f scripts/collect.sql (run ANALYZE first on tables never analyzed)"
   },
@@ -45,8 +45,8 @@
    "label": "Table sizes: pg_class.reltuples (ybm_reltuples.csv)",
    "without": "Table sizes are unknown, so severities are not adjusted for size (a scan of 500 rows ranks like a scan of 50 million) and single-tablet checks cannot run.",
    "mutes": ["SPL001"],
-   "weakens": {"rules": ["CAP001", "CAP002", "CAP003", "CAP013", "CAP030", "CAP031", "PLN001",
-                         "PLN002", "PLN003", "STA001", "STA002", "STA003"],
+   "weakens": {"rules": ["CAP001", "CAP002", "CAP003", "CAP013", "CAP014", "CAP030", "CAP031", "PLN001",
+                         "PLN002", "PLN003", "STA001", "STA002", "STA003", "MEAS001"],
                "caveat": "table size unknown"},
    "stages": ["size-adjusted severity"],
    "collect": "ysqlsh -f scripts/collect.sql"
@@ -66,7 +66,8 @@
    "label": "Planner settings: pg_settings (ybm_settings.csv)",
    "without": "Whether the cost model, bitmap scans and merge scans are on is taken from release defaults, and on releases where deployment tools set them differently the answer is unknown. Access-path conclusions that depend on the planner mode are conditional.",
    "mutes": [],
-   "weakens": {"rules": ["CAP001", "CAP010", "CAP011", "CAP012", "CAP040", "CFG001"],
+   "weakens": {"rules": ["CAP001", "CAP010", "CAP011", "CAP012", "CAP014", "CAP040", "CFG001",
+                         "MEAS001"],
                "caveat": "planner settings not captured"},
    "stages": [],
    "collect": "ysqlsh -f scripts/collect.sql, or: SELECT name, setting FROM pg_settings WHERE name LIKE 'yb_%' OR name LIKE 'enable_%';"
@@ -77,7 +78,7 @@
    "label": "Sharding metadata in the dump (ysql_dump --include-yb-metadata)",
    "without": "Keys without a HASH / ASC annotation have their sharding inferred from the database default, not observed. Findings about those keys rest on the inference.",
    "mutes": [],
-   "weakens": {"rules": ["CAP001", "CAP050", "STA001", "STA002", "STA003", "STA004"],
+   "weakens": {"rules": ["CAP001", "CAP014", "CAP050", "STA001", "STA002", "STA003", "STA004"],
                "caveat": "sharding inferred", "scope": "inferred_keys"},
    "stages": [],
    "collect": "ysql_dump --schema-only --include-yb-metadata > schema.sql"

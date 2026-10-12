@@ -114,8 +114,10 @@ def render_prompt(pf, replay_note=None):
     if major:
         w("yb-model preflight: this review would be INCOMPLETE and may be suboptimal. "
           "%d input(s) that change the findings are missing." % len(major))
-    else:
+    elif minor:
         w("yb-model preflight: the main inputs are present; some minor ones are missing.")
+    else:
+        w("yb-model preflight: all inputs present.")
     for title, group in (("Missing, changes the findings", major),
                          ("Missing, minor", minor)):
         if not group:

@@ -10,8 +10,12 @@ import json
 import math
 import os
 import re
+import sys
 
+from . import changes as ch_mod
+from . import dossier as dossier_mod
 from . import schema as schema_mod
+from . import server as server_mod
 from . import sqlshape
 
 SEV = ["critical", "high", "medium", "low", "info"]
@@ -176,14 +180,30 @@ class Finding:
         self.table = table
         self.index = index
         self.replay = None
+        self.changes = []
         self.ddl = ddl
         self.measured = None
         self.caveats = []
         self.verified = None
         self.disputed = None  # why replay or a probe under assumed settings disagreed
+        self.guarded = False  # its index enforces a unique guarantee: never a drop option
+        self.excluded_options = ()  # option ids that do not apply to this object
+        self.option_checks = {}  # option id -> {"modelled", "costs"} (safety.annotate)
+        self.sketched_option = None  # the option the engine modelled by default
 
     def key(self):
         return (self.rule, self.obj)
+
+    @property
+    def ddl(self):
+        """The recommendation's DDL, rendered from its structured changes (changes.py)."""
+        return ch_mod.render(self.changes)
+
+    @ddl.setter
+    def ddl(self, value):
+        if isinstance(value, str):
+            raise TypeError("a finding's DDL is a list of changes.Change, not text")
+        self.changes = list(value or [])
 
     def to_dict(self, rules, version=None, release=None, unavailable=()):
         from . import versions
@@ -209,6 +229,11 @@ class Finding:
                 "fact": self.fact, "mechanism": r.get("mechanism"),
                 "fix": fix, "evidence_needed": self.evidence,
                 "test_refs": r.get("test", []), "replay": self.replay, "ddl": self.ddl,
+                "changes": [c.to_dict() for c in self.changes],
+                "options": dossier_mod.options(r, self.changes, guarded=self.guarded,
+                                               checks=self.option_checks,
+                                               sketched=self.sketched_option,
+                                               exclude=self.excluded_options),
                 "measured": self.measured, "verified": self.verified,
                 "observed": versions.observations(self.rule)}
 
@@ -439,7 +464,52 @@ def eval_path(idx, ops, shape, table, cbo):
     res["status"] = "ok"
     res["full_unique"] = idx.unique and res["bound"] == len(idx.keys) and all(
         ops.get(_keyid(k), set()) & set(BIND_EQ) for k in idx.keys)
+    res["binding"] = binding_map(idx, ops)
     return res
+
+
+# How a key column is constrained by a pattern, in the order DocDB reads the key.
+BIND_CODE = (("eq", BIND_EQ), ("in", ("in",)), ("range", BIND_RANGE), ("or_eq", ("or_eq",)))
+
+
+def binding_map(idx, ops):
+    """For each key column of idx: eq, in, range, or_eq (bound by equality in every OR arm),
+    filter (named only in a filter: !=, OR, LIKE ...) or none; and, from it, the bound prefix,
+    the gap (unbound or filtered columns after it) and the columns bound after the gap. DocDB
+    reaches a column bound after a gap by seeking under every distinct value of the gap, so the
+    cost of such a read grows with that count, not with the rows returned."""
+    cols = []
+    for k in idx.keys:
+        o = ops.get(_keyid(k), set())
+        code = next((c for c, opset in BIND_CODE if o & set(opset)), "filter" if o else "none")
+        cols.append({"col": k.label, "code": code})
+    return derive_binding(cols, len(idx.hash_cols))
+
+
+def derive_binding(cols, n):
+    """From per-column codes in key order (n hash columns): the bound prefix, the gap after it
+    and the columns bound after the gap. Used for the model's map and for the plan's."""
+    if n and any(c["code"] not in ("eq", "in") for c in cols[:n]):
+        return {"cols": cols, "prefix": 0, "gap": [], "after_gap": [], "or_bound": []}
+    prefix = n
+    for c in cols[n:]:
+        if c["code"] in ("eq", "in"):
+            prefix += 1
+            continue
+        if c["code"] in ("range", "op"):  # bound, and the last column the seek uses
+            prefix += 1
+        break
+    # An or_eq column is bound arm by arm when the planner turns the OR into a BitmapOr, and
+    # filtered otherwise: it is not a gap, and is listed apart (or_bound).
+    bound = ("eq", "in", "range", "or_eq", "op")
+    rest = cols[prefix:]
+    last = max((i for i, c in enumerate(rest) if c["code"] in bound), default=0)
+    first = next((i for i, c in enumerate(rest[:last]) if c["code"] not in bound), None)
+    gap = [c["col"] for c in rest[:last] if c["code"] not in bound]
+    after = [c["col"] for c in rest[first + 1:last + 1] if c["code"] in bound] \
+        if first is not None else []
+    return {"cols": cols, "prefix": prefix, "gap": gap, "after_gap": after,
+            "or_bound": [c["col"] for c in rest if c["code"] == "or_eq"]}
 
 
 def _bind_count(idx, ops):
@@ -584,12 +654,11 @@ def n_distinct_abs(st, rows):
 
 def _rekey_comment(tname, key, colocated, steps="Create the replacement, copy, swap names",
                    fks=()):
-    """A primary-key change, which YSQL cannot make in place, as comment lines. The safety pass
-    reads the CREATE TABLE line, so names are written as in DDL; a colocated table takes no
-    SPLIT clause. Foreign keys that reference the table follow the old one through a swap, so
-    they are named for moving."""
-    return ("-- %s: a primary key cannot be changed in place. %s:\n-- CREATE TABLE %s (... "
-            "PRIMARY KEY (%s))%s;%s" % (
+    """A primary-key change, which YSQL cannot make in place, as comment lines (a "rekey"
+    change); a colocated table takes no SPLIT clause. Foreign keys that reference the table
+    follow the old one through a swap, so they are named for moving."""
+    return ch_mod.rekey(tname, key, "-- %s: a primary key cannot be changed in place. %s:\n-- "
+                        "CREATE TABLE %s (... PRIMARY KEY (%s))%s;%s" % (
                 tname, steps, schema_mod.qn(tname + "_new"), key,
                 "" if colocated else " SPLIT INTO <n> TABLETS",
                 ("\n-- foreign keys that reference %s (%s) must be dropped before the swap and "
@@ -610,17 +679,45 @@ def _usage_scope(bundle):
     return "%d of %d node%s" % (n, total, "" if total == 1 else "s")
 
 
-def _check_then_drop(name, ddl=None):
-    """A DROP INDEX preceded by the read-only check to run on every node first (each node's
-    pg_stat_user_indexes counts only the scans that went through it)."""
-    return ("-- first, on every node: SELECT idx_scan FROM pg_stat_user_indexes WHERE "
-            "indexrelname = '%s';  drop only if 0 on all of them\n%s" % (
-                schema_mod.bare(name), ddl or schema_mod.drop_index_sql(name)))
+def _check_then_drop(name, changes=None, sch=None):
+    """A DROP INDEX (or the given changes) preceded by the read-only check to run on every node
+    first (each node's pg_stat_user_indexes counts only the scans that went through it). A
+    partitioned index is never listed there: the check reads its partitions' copies."""
+    names = usage_names(sch, name) if sch is not None else [name]
+    if names == [name]:
+        cols, cond, what = "idx_scan", "indexrelname = '%s'" % schema_mod.bare(name), \
+            "0 on all of them"
+    else:
+        cols = "indexrelname, idx_scan"
+        cond = "indexrelname IN (%s)" % ", ".join("'%s'" % schema_mod.bare(n) for n in names)
+        what = "every row shows 0 on every node (%s is partitioned: its scans are counted on " \
+               "the partitions' copies)" % schema_mod.bare(name)
+    return [ch_mod.check("-- first, on every node: SELECT %s FROM pg_stat_user_indexes WHERE "
+                         "%s;  drop only if %s" % (cols, cond, what))] + \
+        (list(changes) if changes else [ch_mod.drop(name)])
+
+
+def usage_names(sch, name):
+    """The indexes whose usage counters measure `name`: itself, or for a partitioned index,
+    which pg_stat_user_indexes never lists (it shows plain tables' indexes only), the copies
+    on its partitions."""
+    copies = [n for n in partition_copies(sch, name) if not partition_copies(sch, n)]
+    return copies or [name]
+
+
+def index_usage_of(sch, bundle, name):
+    """Usage counters of an index, as {"idx_scan": n}: its own, or its partitions' copies
+    summed. None when they were not captured; a scan on any captured copy still counts."""
+    us = [bundle.index_usage.get(n) for n in usage_names(sch, name)]
+    seen = [u for u in us if u is not None]
+    if not seen or (len(seen) < len(us) and not any(u["idx_scan"] > 0 for u in seen)):
+        return None
+    return {"idx_scan": sum(u["idx_scan"] for u in seen)}
 
 
 def partition_copies(sch, name):
     """Indexes the server created on partitions as copies of partitioned index `name`, at any
-    depth (catalog mode only: Index.parent)."""
+    depth (Index.parent: ALTER INDEX ... ATTACH PARTITION in a dump, or the catalog)."""
     out, todo = [], [name]
     while todo:
         n = todo.pop()
@@ -630,13 +727,29 @@ def partition_copies(sch, name):
     return out
 
 
+def _split_qual(name):
+    """(schema, name) of a possibly qualified name as lint prints it."""
+    parts = name.strip().split(".")
+    return (parts[0], parts[1]) if len(parts) == 2 else (None, parts[0])
+
+
+def _old_key_unique(sch, tname, t):
+    """After a re-key, the old primary key's columns stay unique as a secondary index (the new
+    key may be wider, or other columns)."""
+    name = schema_mod.bare(tname) + "_old_pk"
+    return ch_mod.create(schema_mod.new_index_sql(
+        sch, name, tname,
+        schema_mod.key_group([k.sql for k in t.pk.keys], sch.is_colocated(tname), None),
+        unique=True, note="after the swap: the old key stays unique"), name)
+
+
 def _old_index_note(name):
     """After a table swap the old index belongs to the retired table: the new table never had
     it, and dropping the old table drops it. A DROP INDEX for it would be wrong at any point
     (before the swap it removes a live access path, and any foreign key built on it blocks
     it), so it is a note, not DDL."""
-    return ("-- %s is not created on the new table; it goes when the old table is dropped "
-            "after the swap" % schema_mod.qn(name))
+    return ch_mod.retire(name, "-- %s is not created on the new table; it goes when the old "
+                         "table is dropped after the swap" % schema_mod.qn(name))
 
 
 def search_path(bundle):
@@ -752,6 +865,18 @@ def run(bundle, plans=None, schema_override=None):
 
     dropped, listed = [], {}
     patterns = build_patterns(bundle, sch, dropped, listed)
+    if getattr(bundle, "capture_label_fallbacks", None) and len(bundle.captures) > 1:
+        open_items.append(
+            "The captures in %s were taken over a loopback address or a Unix socket, which "
+            "does not say which node they came from; each is counted as the node of its folder, "
+            "but nothing shows the folders are different nodes, so drops still start with a "
+            "check on every node. Capture each node over its own address to remove this."
+            % ", ".join(bundle.capture_label_fallbacks))
+    for f in getattr(bundle, "empty_files", []):
+        open_items.append(
+            "%s is empty: the query that writes it failed during capture (for ybm_pss.csv, "
+            "usually pg_stat_statements not installed in that database), so it was treated as "
+            "missing." % f)
     for label, folder in getattr(bundle, "duplicate_captures", []):
         open_items.append("The capture in %s is from node %s, which another folder already "
                           "holds; it was not added a second time." % (folder, label))
@@ -763,6 +888,28 @@ def run(bundle, plans=None, schema_override=None):
             "scans may still be used through another node, so drops start with a check on "
             "every node. Running collect.sql once per node, each into its own folder of the "
             "bundle, removes this." % _usage_scope(bundle))
+    by_schema = {}
+    for name, key in sorted(sch.off_path.items()):
+        by_schema.setdefault(schema_mod.split_key(key)[0] or "public", []).append(name)
+    for nsp, names in sorted(by_schema.items()):
+        open_items.append(
+            "Queries name %s without a schema; only schema %s defines %s, and it is not on the "
+            "search path (%s)%s. The review reads them as %s's tables; the server would not "
+            "find them under that search path, so the application must set its own." % (
+                ", ".join(names[:8]) + (" and %d more" % (len(names) - 8) if len(names) > 8
+                                        else ""), nsp, "it" if len(names) == 1 else "them",
+                ", ".join(sch.search_path),
+                "" if bundle.settings.get("search_path") else
+                ", the server default; pg_settings did not include search_path", nsp))
+    for name, keys in sorted(sch.unresolved.items()):
+        open_items.append(
+            "Queries name %s without a schema; %s define it, but none of them is on the search "
+            "path (%s)%s. The server would not find it either, so those statements were left "
+            "out. If the application sets search_path per connection (one schema per tenant, "
+            "for example), capture that setting or qualify the names in queries.sql." % (
+                name, " and ".join(keys), ", ".join(sch.search_path),
+                "" if bundle.settings.get("search_path") else
+                ", the server default; pg_settings did not include search_path"))
     for name, (hit, others) in sorted(sch.ambiguous.items()):
         open_items.append(
             "Queries name %s without a schema, and %s define it: they were read as %s, the "
@@ -799,6 +946,15 @@ def run(bundle, plans=None, schema_override=None):
                               "; ".join("%s: %d (%.1f%%)" % (k, n, 100 * ms / all_ms)
                                         for k, (n, ms) in sorted(by.items()))))
     chosen_by = {}   # index name -> [pattern ids]
+    # The replayed plans' access, when replay stands: the access source for every pattern
+    # that planned (access_record).
+    plan_taken, plan_seen, path_gaps = {}, {}, []
+    if plans:
+        ast = access_standing(plans)
+        if ast["usable"] or ast.get("weak"):
+            plan_seen = {k: v for k, v in plan_access(plans, patterns, sch).items() if v}
+        if ast["usable"]:
+            plan_taken = plan_seen
 
     for pat in patterns:
         w = pat["weight"]
@@ -818,7 +974,7 @@ def run(bundle, plans=None, schema_override=None):
                 rows = table_rows(bundle, sch, table)
                 ops = _pred_index(preds)
                 filt = [p for p in preds if p.op != "join"]
-                paths = []
+                paths = []  # every candidate index, evaluated for this query (enumeration)
                 for idx in sch.indexes_on(table):
                     r = eval_path(idx, ops, sh, table, ps["cbo"])
                     if r["usable"]:
@@ -826,16 +982,22 @@ def run(bundle, plans=None, schema_override=None):
                         cov, miss = covering(idx, sh, table, tcols)
                         r["covering"], r["missing"] = cov, miss
                     paths.append((idx, r))
-                best = choose([r for _, r in paths], limit=bool(sh.limit))
-                walk = ordered_walk(sch, table, ops, sh) if best is None else None
-                acc = {"table": table, "rows": rows,
-                       "path": best["index"] if best else (walk.name if walk else None),
-                       "walk": bool(walk),
-                       "bound": best["bound"] if best else 0,
-                       "point": bool(best and best["full_unique"]),
-                       "order_ok": best.get("order_ok") if best else None,
-                       "covering": best.get("covering") if best else None,
-                       "skip_scan": bool(best and best["skip_scan"])}
+                # The access the pattern takes: one record, decided in one place; the rules
+                # below read the chosen path from it (best), the candidates from paths.
+                acc, best, walk, model_best = access_record(
+                    sch, table, rows, sh, ops, paths, plan_taken.get((pat["id"], table)))
+                if acc["source"] == "plan" and (model_best or {}).get("index") != acc["path"]:
+                    path_gaps.append({"layer": "path", "pattern": pat["id"], "table": table,
+                                      "model": (model_best or {}).get("index") or "no index",
+                                      "server": acc["path"] or "sequential scan",
+                                      "taken": "plan"})
+                elif acc["source"] == "model" and (pat["id"], table) in plan_seen and \
+                        plan_seen[(pat["id"], table)]["index"] != acc["path"]:
+                    # A weak plan (no statistics) disagrees: the model's access stands.
+                    path_gaps.append({"layer": "path", "pattern": pat["id"], "table": table,
+                                      "model": acc["path"] or "no index",
+                                      "server": plan_seen[(pat["id"], table)]["index"] or
+                                      "sequential scan", "taken": "model"})
                 pat["access"].append(acc)
                 if best:
                     chosen_by.setdefault(best["index"], []).append(pat["id"])
@@ -850,7 +1012,8 @@ def run(bundle, plans=None, schema_override=None):
                 # only because the query does not imply its predicate.
                 if best is not None:
                     better = [(i, r) for i, r in paths if r["status"] == "partial_not_implied"
-                              and (r.get("would_bind") or 0) > best["bound"]]
+                              and (r.get("would_bind") or 0) > best["bound"]
+                              and r is not best]  # never the access itself
                     if better:
                         i, r = better[0]
                         col.add(Finding("CAP021", shift("medium", sev_shift), "probable",
@@ -864,7 +1027,7 @@ def run(bundle, plans=None, schema_override=None):
                 # A keyset cursor written only as a row comparison: the next key column after
                 # the bound prefix is constrained by ROW(...) < ROW(...) and nothing DocDB can
                 # seek on, so every page re-reads the rows before its cursor.
-                bidx = sch.indexes.get(best["index"]) if best else None
+                bidx = sch.indexes.get(best["index"]) if best and best.get("usable") else None
                 if bidx is not None and best["bound"] < len(bidx.keys):
                     nxt = bidx.keys[best["bound"]]
                     o = ops.get(_keyid(nxt), set())
@@ -880,12 +1043,16 @@ def run(bundle, plans=None, schema_override=None):
                                             "hash" if best["hash_bound"] else "leading",
                                             size_txt),
                                         pid, table=table, index=bidx.name,
-                                        fix="Keep the row comparison and add a plain bound "
-                                            "on its first column in the same direction: AND "
-                                            "%s <= $cursor (when paging with <) or AND %s >= "
-                                            "$cursor (with >). DocDB seeks on the plain "
-                                            "bound; the row comparison then only breaks "
-                                            "ties within that value." % (rc[0], rc[0])))
+                                        fix="DocDB seeks on a plain bound, not on a row "
+                                            "comparison: with a plain bound on its first "
+                                            "column in the same direction as well (AND %s <= "
+                                            "$cursor when paging with <, AND %s >= $cursor "
+                                            "with >), the scan would seek and the row "
+                                            "comparison would only break ties within that "
+                                            "value." % (rc[0], rc[0])))
+                gapf = _key_gap(sch, bundle, table, rows, pat, sh, best, paths, sev_shift, size_txt)
+                if gapf is not None:
+                    col.add(gapf)
                 if walk is not None and preds and filt:
                     cols_txt = ", ".join(sorted({p.col or p.expr for p in filt}))
                     col.add(Finding("CAP012", shift("medium", sev_shift), "probable",
@@ -896,11 +1063,17 @@ def run(bundle, plans=None, schema_override=None):
                                     "means most of the index is read." % (
                                         pat["id"], cols_txt, walk.name, size_txt),
                                     pid, table=table, index=walk.name,
-                                    fix="Index the filter column(s) with the ORDER BY columns "
-                                        "after them (equality columns HASH, then the order "
-                                        "columns), so the query seeks and reads only the LIMIT "
+                                    fix="An index on the filter column(s) with the ORDER BY "
+                                        "columns after them (equality columns HASH, then the "
+                                        "order columns) would let the query seek and read only the LIMIT "
                                         "rows."))
-                elif best is None and preds:
+                elif best is not None and best.get("status") == "hash_unbound" and preds \
+                        and not any(r["usable"] for _, r in paths):
+                    # The access taken is an index whose hash group the pattern does not bind.
+                    col.add(_cap001(sch, table, best_index(paths, best), best, ops, pat,
+                                    sev_shift, size_txt))
+                elif best is None and preds and not any(r["usable"] for _, r in paths):
+                    # No index can serve the pattern (a schema fact, whatever path was taken).
                     only_join = not filt
                     hash_unb = [(i, r) for i, r in paths if r["status"] == "hash_unbound"]
                     partial = [(i, r) for i, r in paths if r["status"] == "partial_not_implied"
@@ -919,41 +1092,7 @@ def run(bundle, plans=None, schema_override=None):
                                         pid, table=table))
                     elif hash_unb:
                         i, r = hash_unb[0]
-                        bound = [k for k in i.hash_cols if k.label not in r["hash_missing"]]
-                        rest = [k for k in i.keys if k not in bound]
-                        newkey = "(%s) HASH%s" % (", ".join(k.sql for k in bound), "".join(
-                            ", %s %s" % (k.sql, "ASC" if k.mode == "HASH" else k.mode)
-                            for k in rest))
-                        ranged_hash = any(ops.get(_keyid(k), set()) & set(BIND_RANGE)
-                                          for k in i.hash_cols)
-                        if ranged_hash:
-                            hc = ", ".join(k.sql for k in i.hash_cols)
-                            c1fix = ("A range on a hash column cannot seek. For chunked scans or "
-                                     "exports, split the work on yb_hash_code(%s) ranges "
-                                     "(0..65535), which seek; otherwise bind every hash column "
-                                     "with equality." % hc)
-                            c1ddl = None
-                        elif i.is_pk:
-                            c1fix = ("Re-key %s as PRIMARY KEY (%s): same uniqueness, and the "
-                                     "pattern then binds the whole hash group." % (table, newkey))
-                            c1ddl = _rekey_comment(table, newkey, sch.is_colocated(table),
-                                                   fks=sch.fks_referencing(table))
-                        else:
-                            c1fix = "Index the bound columns as the hash group: (%s)." % newkey
-                            c1ddl = "CREATE INDEX CONCURRENTLY %s ON %s (%s);" % (
-                                schema_mod.qi(schema_mod.ident("%s_%s" % (
-                                    schema_mod.bare(table), "_".join(
-                                        re.sub(r"\W+", "_", k.label).strip("_")
-                                        for k in bound)))),
-                                schema_mod.qn(table), newkey)
-                        col.add(Finding("CAP001", shift("high", sev_shift), "probable",
-                                        "%s on %s" % (i.name, table),
-                                        "%s filters %s but does not bind %s of %s's hash group "
-                                        "[%s] with equality; no other index serves it%s." % (
-                                            pat["id"], table, ", ".join(r["hash_missing"]),
-                                            i.name, ", ".join(k.label for k in i.hash_cols),
-                                            size_txt),
-                                        pid, table=table, index=i.name, fix=c1fix, ddl=c1ddl))
+                        col.add(_cap001(sch, table, i, r, ops, pat, sev_shift, size_txt))
                     elif partial:
                         i, r = partial[0]
                         col.add(Finding("CAP021", shift("medium", sev_shift), "probable",
@@ -994,22 +1133,24 @@ def run(bundle, plans=None, schema_override=None):
                             if table in sh.select_all:
                                 proj = [c for c in t.col_order]
                             inc = [c for c in proj if c in t.cols]
-                            cddl = "CREATE %sINDEX CONCURRENTLY %s ON %s (%s)%s;" % (
-                                "UNIQUE " if uniq else "", schema_mod.qi(schema_mod.ident(
-                                    "%s_%s" % (schema_mod.bare(table), re.sub(
-                                        r"[^a-z0-9]+", "_", e.lower()).strip("_")))),
-                                schema_mod.qn(table),
+                            name3 = "%s_%s" % (schema_mod.bare(table), re.sub(
+                                r"[^a-z0-9]+", "_", e.lower()).strip("_"))
+                            sql3 = schema_mod.new_index_sql(
+                                sch, name3, table,
                                 ("(%s) ASC" if sch.is_colocated(table) else "(%s) HASH") % e,
-                                (" INCLUDE (%s)" % ", ".join(schema_mod.qi(c) for c in inc))
-                                if inc else "")
-                            cfix = ("Add an expression index that matches the query text exactly "
-                                    "(%s)." % e)
+                                unique=bool(uniq), include=inc)
+                            cddl = [ch_mod.create(sql3, name3)] if sql3 else None
+                            cfix = ("An expression index matching the query text exactly (%s) "
+                                    "would make the predicate seekable (the expression_index "
+                                    "option)." % e)
                             if uniq:
                                 cfix += (" The existing unique index on %s is case-sensitive while "
                                          "the lookup is not, so values differing only in case can "
-                                         "coexist; making the expression index UNIQUE closes that "
-                                         "(check for existing case duplicates first), after which "
-                                         "the plain unique index can be dropped." % ecol)
+                                         "coexist; a UNIQUE expression index would close that "
+                                         "(after checking for existing case duplicates). The plain "
+                                         "unique index stays: foreign keys and ON CONFLICT targets "
+                                         "on %s need an index on exactly that column." % (
+                                             ecol, ecol))
                         col.add(Finding("CAP003", shift("medium", sev_shift), "probable",
                                         "%s(%s)" % (table, desc),
                                         "%s filters %s only with non-seekable predicates "
@@ -1051,30 +1192,32 @@ def run(bundle, plans=None, schema_override=None):
                                                 " with LIMIT" if sh.limit else "",
                                                 best["index"], idx.signature() if idx else "?"),
                                             pid, table=table, index=best["index"]))
-                    if sh.kind == "select" and not best["covering"] and not best["is_pk"]:
+                    if sh.kind == "select" and "covering" in best and not best["covering"] \
+                            and not best["is_pk"] and best.get("missing"):  # known, and named
                         miss = best["missing"]
-                        fix = ("Project only the needed columns; SELECT * cannot be covered."
+                        fix = ("SELECT * cannot be covered, so only fewer columns (the "
+                               "fewer_columns option) would avoid the fetch."
                                if miss == ["*"] else
-                               "CREATE INDEX ... INCLUDE (%s) replacing %s, if the columns are "
-                               "small and stable." % (", ".join(miss), best["index"]))
+                               "INCLUDE (%s) on %s would make it covering, if those columns are "
+                               "small and stable (the include option, a rebuild)." % (
+                                   ", ".join(miss), best["index"]))
                         ddl = None
                         if miss == ["*"] and idx is not None and 0 < len(tcols) <= \
                                 THRESHOLDS["include_all_cols"]:
                             rest = [c for c in t.col_order if c not in idx.key_names]
                             miss = rest
-                            fix = ("The table has only %d columns: INCLUDE (%s) makes %s covering "
-                                   "even for SELECT *, then drop the original." % (
+                            fix = ("The table has only %d columns: INCLUDE (%s) would make %s "
+                                   "covering even for SELECT * (the include option, a rebuild)." % (
                                        len(tcols), ", ".join(rest), best["index"]))
                         if miss != ["*"] and idx is not None:
-                            new = schema_mod.ident(idx.name + "_cov")
-                            ddl = schema_mod.index_sql(
-                                idx, new, table, add_include=miss,
-                                colocated=sch.is_colocated(table),
-                                partitioned=bool(sch.tables[table].partition_by)) + "\n" + \
-                                schema_mod.drop_sql(idx, new)
+                            ddl = ch_mod.replace(
+                                idx, schema_mod.ident(idx.name + "_cov"), table=table,
+                                add_include=miss, colocated=sch.is_colocated(table),
+                                partitioned=bool(sch.tables[table].partition_by))
                             if idx.unique:
-                                fix += (" Keep it UNIQUE: the original enforces a constraint, so "
-                                        "drop it only after the replacement is valid.")
+                                fix += (" The original enforces a constraint, so the replacement "
+                                        "stays UNIQUE and the original goes only once the "
+                                        "replacement is valid.")
                         col.add(Finding("CAP020", shift("medium", sev_shift + (1 if best["full_unique"]
                                                                                 else 0)),
                                         "probable", "%s on %s" % (best["index"], table),
@@ -1163,11 +1306,12 @@ def run(bundle, plans=None, schema_override=None):
                                                 (" (~%s NULL rows on one hash code)" %
                                                  _fmt(null_rows)) if null_rows else ""),
                                             table=tname, index=idx.name,
-                                            fix="Replace %s with a partial index WHERE %s IS NOT "
-                                                "NULL: create it, verify indisvalid, then drop "
-                                                "the original. Patterns that use it must carry "
-                                                "AND %s IS NOT NULL (or an equality on %s)." % (
-                                                    idx.name, lead.col, lead.col, lead.col),
+                                            fix="A partial index on the rows with a value (WHERE "
+                                                "%s IS NOT NULL, the partial option) would leave "
+                                                "the NULLs out of %s; patterns that use it would "
+                                                "then need AND %s IS NOT NULL (or an equality "
+                                                "on %s)." % (lead.col, idx.name, lead.col,
+                                                             lead.col),
                                             ddl=_replace_ddl(
                                                 idx, "_nn", tname, t, coloc,
                                                 add_where="%s IS NOT NULL" %
@@ -1215,7 +1359,8 @@ def run(bundle, plans=None, schema_override=None):
                                         "%s(%s)" % (idx.name, lead.col),
                                         "%s hashes %s.%s; its most common value holds %.1f%% of "
                                         "rows." % (idx.name, tname, lead.col, 100 * top),
-                                        table=tname, index=idx.name, fix=_key_fix(idx, tname)))
+                                        table=tname, index=idx.name,
+                                        fix=_key_fix(idx, tname, hot_apart=True)))
             elif lead.mode in ("ASC", "DESC") and not coloc and not idx.is_pk and t.pk and \
                     t.pk.keys and t.pk.keys[0].mode == "HASH" and \
                     not _few_values(t, lead.col, st, rows, idx) and \
@@ -1231,8 +1376,9 @@ def run(bundle, plans=None, schema_override=None):
                                     t.cols.get(lead.col, {}).get("type", "?"),
                                     (", ~%s distinct" % _fmt(nd)) if nd else ""),
                                 table=tname, index=idx.name,
-                                fix="Bucket the index so inserts spread, or HASH it if no range "
-                                    "query needs it; drop it if nothing uses it.",
+                                fix="A bucketed index (the bucket option) would spread the "
+                                    "inserts; a hash key (the hash option) would too, if no "
+                                    "range query needs this order.",
                                 ddl=_bucket_ddl(idx, tname, t, lead.col)))
             elif lead.mode in ("ASC", "DESC") and not coloc and \
                     not _few_values(t, lead.col, st, rows, idx):
@@ -1261,15 +1407,21 @@ def run(bundle, plans=None, schema_override=None):
                             else "medium"
                         sev = shift(sev, size_shift(rows))
                         if idx.is_pk:
-                            s4fix = ("Rebuild %s with PRIMARY KEY ((%s) HASH) if access by %s is "
-                                     "equality. A primary key cannot contain an expression, so a "
-                                     "bucketed range key needs a stored bucket column." % (
-                                         tname, lead.col, lead.col))
-                            s4ddl = _rekey_comment(tname, "(%s) HASH" % schema_mod.qi(lead.col),
-                                                   coloc, fks=sch.fks_referencing(tname))
+                            # The hash goes on the lead; every other key column stays, so the
+                            # key keeps exactly the uniqueness it has.
+                            pk4 = schema_mod.key_group([schema_mod.qi(lead.col)] + [
+                                k.sql for k in idx.keys[1:]], coloc)
+                            s4fix = ("A hash on %s would spread the inserts if access by %s is "
+                                     "equality; the key keeps its other columns (%s), so it "
+                                     "enforces the same uniqueness. A primary key cannot contain "
+                                     "an expression, so a bucketed range key needs a stored "
+                                     "bucket column." % (lead.col, lead.col, pk4))
+                            s4ddl = [_rekey_comment(tname, pk4, coloc,
+                                                    fks=sch.fks_referencing(tname))]
                         else:
-                            s4fix = ("Replace %s with a bucketed index so inserts spread over N "
-                                     "tablets; ORDER BY %s then merges N buckets." % (idx.name,
+                            s4fix = ("A bucketed %s (the bucket option, a rebuild) would spread "
+                                     "inserts over N tablets; ORDER BY %s would then merge N "
+                                     "buckets." % (idx.name,
                                                                                        lead.col))
                             s4ddl = _bucket_ddl(idx, tname, t, lead.col)
                         seen_writes = bool(ww or writes_measured)
@@ -1306,13 +1458,31 @@ def run(bundle, plans=None, schema_override=None):
         secondary = [i for i in sch.indexes_on(tname, own_only=True) if not i.is_pk]
         ww = write_weight.get(tname)
         if ww == "HOT" and len(secondary) >= THRESHOLDS["write_hot_indexes"]:
+            # Unique indexes cost writes too, but they enforce constraints: the fix never
+            # offers them for removal (prose advice is not checked by the safety pass).
+            uniq = [i.name for i in secondary if i.unique]
+            others = [i.name for i in secondary if not i.unique]
             col.add(Finding("WRK004", "medium", "confirmed" if bundle.pss else "probable",
                             tname, "%s is written by HOT patterns and carries %d secondary "
                             "indexes (%s)." % (tname, len(secondary),
                                                ", ".join(i.name for i in secondary)),
-                            table=tname))
+                            table=tname,
+                            fix=(("%s %s unique and enforce%s a constraint, so no option "
+                                  "removes %s. " % (
+                                      ", ".join(uniq), "are" if len(uniq) > 1 else "is",
+                                      "" if len(uniq) > 1 else "s",
+                                      "them" if len(uniq) > 1 else "it")) if uniq else "") + (
+                                ("Of %s, the index findings (WRK003, IDX001) show which serve "
+                                 "nothing; their options say what to check before removing "
+                                 "one. Indexes that share a prefix may merge into one." %
+                                 ", ".join(others)) if others
+                                else "With every index needed, only the writes can change: "
+                                     "fewer updates of indexed columns, or batched inserts "
+                                     "(the fewer_writes option).")))
         for i in secondary:
-            u = bundle.index_usage.get(i.name)
+            if i.parent:  # a partition's copy: YSQL changes it only through its parent
+                continue
+            u = index_usage_of(sch, bundle, i.name)
             if u is not None and u["idx_scan"] == 0 and not i.unique:
                 every = _usage_complete(bundle)
                 col.add(Finding("WRK003", "medium" if ww else "low",
@@ -1323,13 +1493,13 @@ def run(bundle, plans=None, schema_override=None):
                                     if bundle.meta.get("postmaster_start") else "",
                                     "" if every else " on %s" % _usage_scope(bundle)),
                                 table=tname, index=i.name,
-                                fix="Confirm no batch or periodic job needs it, then drop it." if
+                                fix="No node shows a scan, so it only costs writes, unless a "
+                                "batch or periodic job outside the capture window uses it." if
                                 every else "pg_stat_user_indexes counts only the scans that ran "
-                                "through the node it is read on: check idx_scan on every node, "
-                                "and confirm no batch or periodic job needs it, before dropping "
-                                "it.",
-                                ddl=schema_mod.drop_index_sql(i.name) if every else
-                                _check_then_drop(i.name)))
+                                "through the node it is read on, so whether it is unused depends "
+                                "on idx_scan on every node and on batch or periodic jobs.",
+                                ddl=[ch_mod.drop(i.name)] if every else
+                                _check_then_drop(i.name, sch=sch)))
             elif (bundle.pss or bundle.declared_complete) and i.name not in chosen_by and \
                     not i.unique and \
                     not (u is not None and u["idx_scan"] > 0) and \
@@ -1457,7 +1627,10 @@ def run(bundle, plans=None, schema_override=None):
                                 iname, idx.table, idx.keys[0].col,
                                 " (and NULL)" if not t.cols[idx.keys[0].col].get("notnull") else ""),
                             table=idx.table, index=iname,
-                            ddl=schema_mod.drop_index_sql(iname)))
+                            fix=("%s enforces uniqueness on a boolean, which allows one row per "
+                                 "value: usually a deliberate guard (a singleton row, or one "
+                                 "active row), so it stays." % iname) if idx.unique else None,
+                            ddl=None if idx.unique else [ch_mod.drop(iname)]))
     # Absolute skew: one value with many rows on one hash code, below the share thresholds.
     for tname in sorted(sch.tables):
         rows = table_rows(bundle, sch, tname)
@@ -1482,10 +1655,10 @@ def run(bundle, plans=None, schema_override=None):
                                     ", which can never be split across tablets"
                                     if sev != "low" else ""),
                                 table=tname, index=idx.name,
-                                fix=_key_fix(idx, tname) or
-                                "Confirm the dominant value is expected; if it keeps growing, "
-                                "make the hash group composite with a second column the "
-                                "pattern binds."))
+                                fix=_key_fix(idx, tname, hot_apart=True) or
+                                "If the dominant value is expected and keeps growing, a "
+                                "composite hash group with a second column the pattern binds "
+                                "(the composite option) would spread it."))
 
     # --- workload hygiene: how the application uses the database ------------------------
     for p in patterns:
@@ -1585,18 +1758,14 @@ def run(bundle, plans=None, schema_override=None):
                         "through the unique index %s and then fetches the row." % (
                             tname, old, ", ".join(p["id"] for p, _ in reads), idx.name),
                         [p["id"] for p, _ in reads], table=tname, index=idx.name,
-                        fix="Make %s's key (%s) the primary key and keep the old key unique as "
-                            "a secondary index; lookups become single primary-key reads." % (
+                        fix="With %s's key (%s) as the primary key and the old key kept unique "
+                            "as a secondary index (the swap_keys option, a table swap), lookups "
+                            "would be single primary-key reads." % (
                                 idx.name, newkey),
-                        ddl=_rekey_comment(tname, newkey, sch.is_colocated(tname),
-                                           "Create, copy, swap", sch.fks_referencing(tname)) +
-                            "\nCREATE UNIQUE INDEX CONCURRENTLY %s ON %s (%s);  -- after the "
-                            "swap: the old key stays unique\n%s" % (
-                                schema_mod.qi(schema_mod.ident(schema_mod.bare(tname) +
-                                                               "_old_pk")),
-                                schema_mod.qn(tname), schema_mod.key_group(
-                                    [k.sql for k in t.pk.keys], sch.is_colocated(tname), None),
-                                _old_index_note(idx.name))))
+                        ddl=[_rekey_comment(tname, newkey, sch.is_colocated(tname),
+                                            "Create, copy, swap", sch.fks_referencing(tname)),
+                             _old_key_unique(sch, tname, t),
+                             _old_index_note(idx.name)]))
 
     # --- ON CONFLICT targets ---------------------------------------------------------
     from . import safety as _saf
@@ -1620,13 +1789,15 @@ def run(bundle, plans=None, schema_override=None):
                                     p["id"], sh.conflict_constraint, table, table,
                                     ", ".join(names) or "none"),
                                 [p["id"]], table=table,
-                                fix="Name one of %s's constraints, or target the columns with "
-                                    "ON CONFLICT (columns)." % table))
+                                fix="Only a constraint's name is accepted there; a target "
+                                    "written as columns, ON CONFLICT (columns), would also match "
+                                    "a unique index on %s (the change_target option)." % table))
                 continue
             target = frozenset(sh.conflict_cols)
+            arb = _saf.arbiter_tables(sch, table)  # a partition's parent indexes count too
             near = sorted("%s (%s)" % (n, ", ".join(sorted(k))) for t, k, w, n in uniq
-                          if t == table and k & target)
-            partial = [n for t, k, w, n in uniq if t == table and k == target and w is not None]
+                          if t in arb and k & target)
+            partial = [n for t, k, w, n in uniq if t in arb and k == target and w is not None]
             if partial:
                 # A partial unique index on exactly these columns is the arbiter only when the
                 # statement repeats its predicate.
@@ -1639,8 +1810,10 @@ def run(bundle, plans=None, schema_override=None):
                                 "statement does not repeat its predicate." % (
                                     p["id"], ", ".join(sh.conflict_cols), table, idx.name, pred),
                                 [p["id"]], table=table,
-                                fix="Repeat the index predicate in the statement: ON CONFLICT "
-                                    "(%s) WHERE %s." % (", ".join(sh.conflict_cols), pred)))
+                                fix="The partial index is the arbiter only for a statement that "
+                                    "repeats its predicate, ON CONFLICT (%s) WHERE %s (the "
+                                    "change_target option)." % (", ".join(sh.conflict_cols),
+                                                                pred)))
                 continue
             fix60, ddl60 = _conflict_fix(sch, bundle, table, sh.conflict_cols, target, uniq)
             col.add(Finding("CAP060", "high", "confirmed", "%s ON CONFLICT (%s)" % (
@@ -1664,6 +1837,8 @@ def run(bundle, plans=None, schema_override=None):
                             "at least %s%% of calls find nothing" % (
                                 ("%.1f" % (math.floor(1000 * (1 - p["rows"] / p["calls"])) / 10)
                                  ).rstrip("0").rstrip("."))), [p["id"]],
+                        # one table: the finding belongs to its area (a join belongs to none)
+                        table=p["tables"][0] if len(p["tables"]) == 1 else None,
                         fix="Confirm with the application why this lookup always misses; cache "
                             "the negative result or skip the call."))
     planned = [(p, p["pss"].get("total_plan_time")) for p in patterns
@@ -1721,12 +1896,15 @@ def run(bundle, plans=None, schema_override=None):
                             tname, ", ".join(p["id"] for p, _ in reads), lead, path,
                             ", ".join(k.label for k in t.pk.keys)),
                         [p["id"] for p, _ in reads], table=tname, index=path,
-                        fix="Re-key the table as PRIMARY KEY (%s): the same rows stay unique, "
-                            "lookups by %s become primary-key reads in key order, and %s can be "
-                            "dropped." % (newkey, lead, path),
-                        ddl=_rekey_comment(tname, newkey, coloc, "Create, copy, swap",
-                                           sch.fks_referencing(tname)) +
-                            "\n" + _old_index_note(path)))
+                        fix="With PRIMARY KEY (%s) (the rekey option, a table swap), lookups by "
+                            "%s would be primary-key reads in key order, and %s would no longer "
+                            "be needed. The new key is wider, so the old key (%s) would stay "
+                            "unique as a secondary index." % (
+                                newkey, lead, path, ", ".join(k.label for k in t.pk.keys)),
+                        ddl=[_rekey_comment(tname, newkey, coloc, "Create, copy, swap",
+                                            sch.fks_referencing(tname)),
+                             _old_key_unique(sch, tname, t),
+                             _old_index_note(path)]))
 
     # --- tablet splits ---------------------------------------------------------------
     if bundle.tablets:
@@ -1754,9 +1932,10 @@ def run(bundle, plans=None, schema_override=None):
     if bundle.pss:
         since = bundle.meta.get("postmaster_start")
         open_items.append("pg_stat_statements and pg_stat_user_indexes cover activity since the "
-                          "last stats reset%s; confirm the window includes batch and periodic jobs, "
-                          "or reset with pg_stat_statements_reset() and recapture over a defined "
-                          "window (for example a load test)."
+                          "last stats reset%s; confirm the window includes batch and periodic jobs. "
+                          "A defined window (for example a load test) needs the counters reset "
+                          "with pg_stat_statements_reset(), which discards them on that node for "
+                          "everyone: only the customer's DBA decides that."
                           % ((" (server start %s)" % since) if since else ""))
 
     # --- configuration ----------------------------------------------------------------
@@ -1790,9 +1969,10 @@ def run(bundle, plans=None, schema_override=None):
                             len(unannotated), len(pks),
                             "HASH" if ps["hash_default"] and not sch.db_colocated else "ASC",
                             ", ".join(unannotated[:15]) + (" ..." if len(unannotated) > 15 else "")),
-                        fix="Re-capture with ysql_dump --schema-only --include-yb-metadata and "
-                            "annotate every primary key explicitly (HASH / ASC / DESC) in the "
-                            "migrations so the intent survives any default change."))
+                        fix="A dump taken with ysql_dump --schema-only --include-yb-metadata "
+                            "would show the sharding as created. Keys with no explicit HASH, ASC "
+                            "or DESC take the default of whatever creates them, so the same "
+                            "migrations can shard differently after a default change."))
     if bundle.pss and all(r.get("docdb_rows_scanned") in (None, 0.0) for r in bundle.pss):
         col.add(Finding("CFG003", "info", "confirmed", "pg_stat_statements",
                         "No docdb_* statement statistics present."))
@@ -1820,18 +2000,56 @@ def run(bundle, plans=None, schema_override=None):
             lint_rows.append(row)
             if row["superseded"]:
                 continue
+            if f.rule in ("YB051", "YB052"):
+                # A duplicate or prefix pair of partition copies is the pair of their parents,
+                # which lint reports on the parent table; YSQL drops a copy only through it.
+                im = re.search(r"index '([^']+)'", f.message)
+                tm = re.match(r"^([^:]+):", f.message)
+                key = im and schema_mod.in_schema_of(
+                    schema_mod.rel_key(*_split_qual(tm.group(1))) if tm else "", im.group(1))
+                ix = sch.indexes.get(key) if key else None
+                if ix is not None and ix.parent:
+                    row["superseded"] = True
+                    continue
             if f.rule == "YB020":
                 tm = re.match(r"^(\w+):", f.message)
                 if tm and sch.tables.get(tm.group(1)) and sch.tables[tm.group(1)].pk:
                     row["superseded"] = True
                     continue
             sev = {"error": "high", "warn": "medium", "info": "info"}[f.severity]
-            col.add(Finding("LINT-" + f.rule, sev, "confirmed", "line %d" % f.line, f.message,
-                            fix=f.fix))
+            # The linter's message is the reason; its advice tells the reader what to change,
+            # so it stays in the lint rows (review.json "lint"), not in the finding's text.
+            col.add(Finding("LINT-" + f.rule, sev, "confirmed", "line %d" % f.line, f.message))
         lint_ok = True
     except Exception as e:  # the linter is a separate script; report, never hide
         open_items.append("yb-lint.py failed: %s" % e)
         lint_ok = False
+
+    # --- access-path findings: confidence from where the access came from -------------
+    if plans:
+        from . import plans as _plans_mod
+        st = access_standing(plans)
+        src = {(p["id"], a["table"]): a.get("source") for p in patterns
+               for a in p.get("access", [])}
+        for f in col.items.values():
+            if f.rule not in ACCESS_RULES or not f.table or not f.patterns:
+                continue
+            if not st["usable"]:
+                f.replay = st["why"]
+                continue
+            seen = [(pid, plan_taken[(pid, f.table)]) for pid in f.patterns
+                    if (pid, f.table) in plan_taken and src.get((pid, f.table)) == "plan"]
+            if seen:  # what each replayed plan did, in the server's terms
+                f.replay = "; ".join("%s: %s%s%s" % (
+                    pid, pa["node"], (" using " + pa["index"]) if pa["index"] else "",
+                    (" (binds %s after an unbound %s)" % (
+                        ", ".join(pa["binding"]["after_gap"]), ", ".join(pa["binding"]["gap"])))
+                    if pa["binding"] and pa["binding"]["after_gap"] else "") for pid, pa in seen)
+            if all(src.get((pid, f.table)) == "plan" for pid in f.patterns) and not (
+                    f.rule == "CAP014" and any(plan_taken[(pid, f.table)]["binding"] is None
+                                                for pid in f.patterns)):
+                # The replayed plan took this access (and, for a key gap, showed its binding).
+                f.confidence = st["label"]
 
     # --- replay reconciliation ------------------------------------------------------
     replay_summary = None
@@ -1839,10 +2057,53 @@ def run(bundle, plans=None, schema_override=None):
         from . import plans as plans_mod
         replay_summary = plans_mod.reconcile(plans, patterns, col, sch, rules, THRESHOLDS,
                                              recon, WEIGHT_SHIFT, shift, Finding)
+        replay_summary["access_from_plans"] = access_standing(plans)["usable"]
 
+    # --- the server's binding of predicates to key columns (replayed plans) --------------
+    gaps = _server_bindings(plans, patterns, sch, bundle, col, recon) if plans else []
+
+    # Probe verdicts last: they apply to every finding of a probed rule, those the replayed
+    # plans added included.
     if plans:
         from . import probes as probes_mod
         probes_mod.apply(col, plans, recon)
+
+    # --- the measured pass: anomalies no finding on the pattern explains -----------------
+    measured_pass = (plans or {}).get("measured")
+    # The measured pass ran on the replay image: the same standing as every replay verdict.
+    meas_st = plans_mod.standing(plans, "MEAS001") if plans else None
+    vm = (plans or {}).get("version_match") or {}
+    meas_conf = "measured" if vm.get("exact", True) else \
+        "measured (on %s, %s)" % (
+            vm.get("image_release") or (plans or {}).get("version"),
+            plans_mod.image_relation(vm, vm.get("image_release") or (plans or {}).get("version")))
+    for m in (measured_pass or {}).get("patterns", []):
+        if not m.get("anomalies") or m.get("plan_flip"):
+            continue  # a flipped plan is not the customer's: recorded as a gap, nothing more
+        m["explained_by"] = sorted({f.rule for f in col.items.values()
+                                    if m["id"] in f.patterns and f.rule != "MEAS001"})
+        if m["explained_by"]:
+            continue
+        if not meas_st["usable"]:
+            m["withheld"] = meas_st["why"]
+            continue
+        ret = m.get("returned") or 0
+        over = []
+        if "seeks" in m["anomalies"]:
+            over.append("%s seeks where the read asks for about %d" % (m["seeks"], m["asked"]))
+        if "scanned" in m["anomalies"]:
+            over.append("%s rows scanned for %d returned" % (m["scanned"], ret))
+        worst = max((m.get("seeks") or 0) / max(m.get("asked") or 1, 1),
+                    m.get("scanned_per_row") or 0)
+        col.add(Finding(
+            "MEAS001", "medium" if worst >= 10 else "low", meas_conf,
+            "%s on %s" % (m["id"], m["table"]),
+            "%s, run through %s on a generated sample shaped by the statistics, returned %d "
+            "row(s): %s. No rule explains it." % (
+                m["id"], m.get("index") or m.get("scan") or "a scan", ret, "; ".join(over)),
+            [m["id"]], table=m["table"], index=m.get("index"),
+            fix="No rule covers this measurement: it is a lead for a closer look, and once "
+                "explained it becomes a rule or a pitfalls.md entry."))
 
     # --- measurements corroborate access-path findings ---------------------------------
     for key in sorted(k for k in col.items if k[0] in ("WRK001", "WRK002")):
@@ -1855,7 +2116,7 @@ def run(bundle, plans=None, schema_override=None):
                 if h.confidence == "probable":
                     h.confidence = "confirmed (measured)"
                 elif "replay" in h.confidence and "measured" not in h.confidence:
-                    h.confidence = "confirmed (replay, measured)"
+                    h.confidence += "; measured by the workload's counters"
                 if SEV.index(w.severity) < SEV.index(h.severity):
                     h.severity = w.severity
             del col.items[key]
@@ -1877,64 +2138,46 @@ def run(bundle, plans=None, schema_override=None):
                     pat["id"], a["table"], a["path"],
                     " and in ORDER BY order" if a["order_ok"] else ""))
 
-    # Covering advice is moot for an index that should go (boolean / low-cardinality) or that a
-    # primary-key re-key replaces.
-    doomed = {f.index for f in col.items.values()
-              if f.rule in ("STA002", "STA008", "CAP050", "CAP051") and f.index}
-    for k in [k for k, f in col.items.items() if f.rule == "CAP020" and f.index in doomed]:
-        del col.items[k]
     _fold_partition_copies(col, sch)
-    # An index whose defect would be fixed by a rebuild, but which no ranked pattern uses and
-    # pg_stat_user_indexes does not show scanned, is cheaper to drop than to rebuild. A
-    # partitioned index is used when any partition's copy of it is (queries hit the copies).
-    dropped = {}
-    ranked = sorted(col.items.values(), key=lambda f: (SEV.index(f.severity), f.rule, f.obj))
-    for f in ranked:
+    # A finding on an index that enforces a unique guarantee never offers to drop it.
+    for f in col.items.values():
+        idx = sch.indexes.get(f.index) if f.index else None
+        if idx is None and f.index:
+            idx = next((t.pk for t in sch.tables.values() if t.pk and t.pk.name == f.index), None)
+        f.guarded = bool(idx is not None and (idx.unique or idx.is_pk))
+    # A finding never settles another: two findings on one index stay, each with its options,
+    # and the review's areas show where they pull apart. An index a rebuild would fix, that no
+    # ranked pattern uses and the counters do not show scanned, may be simpler to drop: said
+    # as a note, the drop being one of the options. A partitioned index is used when any copy
+    # of it is (queries hit the copies); a copy changes only through its parent.
+    for f in sorted(col.items.values(), key=lambda f: (SEV.index(f.severity), f.rule, f.obj)):
         if f.rule not in ("STA001", "STA002", "STA003", "STA004") or not f.index:
-            continue
-        if f.index in dropped:
-            f.ddl = None
-            f.fix = "Dropping %s (see the %s finding) resolves this too." % (f.index,
-                                                                          dropped[f.index])
             continue
         idx = sch.indexes.get(f.index)
         names = [f.index] + partition_copies(sch, f.index)
-        if idx is None or idx.unique or idx.is_pk or any(n in chosen_by for n in names):
+        if idx is None or idx.parent or idx.unique or idx.is_pk or not bundle.pss or \
+                any(n in chosen_by for n in names):
             continue
-        if not bundle.pss:
-            continue
-        u = bundle.index_usage.get(f.index)
-        if any((bundle.index_usage.get(n) or {}).get("idx_scan", 0) > 0 for n in names):
+        u = index_usage_of(sch, bundle, f.index)
+        if u is not None and u["idx_scan"] > 0:
             continue
         measured = u is not None and _usage_complete(bundle)
-        f.ddl = (schema_mod.drop_index_sql(f.index) if measured else _check_then_drop(f.index))
-        dropped[f.index] = f.rule
-        f.fix = ("No ranked pattern uses %s%s, so drop it rather than rebuild it. Rebuild "
-                 "only if a reader outside the captured workload needs it: %s" % (
-                     f.index, " and idx_scan is 0 on every node" if measured else
-                     " (idx_scan not captured on every node: check it first)", f.fix or ""))
-    # A finding that drops an index outright settles every other finding on that index: their
-    # rebuilds would recreate what is being dropped. Every bare DROP starts with an idx_scan check
-    # unless pg_stat_user_indexes showed 0 scans.
-    ranked = sorted(col.items.values(), key=lambda f: (SEV.index(f.severity), f.rule, f.obj))
-    drops = {}
-    for f in ranked:
-        if f.index and f.ddl and _pure_drop(f.ddl, f.index) and f.index not in drops:
-            drops[f.index] = f
-    for f in ranked:
-        d = drops.get(f.index)
-        if d is not None and d is not f and f.ddl:
-            f.ddl = None
-            f.fix = "Dropping %s (see the %s finding) resolves this too." % (f.index, d.rule)
-    for iname, f in sorted(drops.items()):
-        u = bundle.index_usage.get(iname)
-        if (u is None or u["idx_scan"] > 0 or not _usage_complete(bundle)) and \
-                "idx_scan" not in f.ddl:
-            f.ddl = _check_then_drop(iname, f.ddl)
+        f.fix = ("%s No ranked pattern uses %s%s, so dropping it (the drop option) may be "
+                 "simpler than changing it, unless a reader outside the captured workload needs "
+                 "it." % ((f.fix or "").strip(), f.index, " and idx_scan is 0 on every node"
+                          if measured else " (idx_scan not captured on every node: check it "
+                          "first)")).strip()
+    # Every sketch that only drops an index starts with the idx_scan check, unless the counters
+    # showed 0 scans on every node.
+    for f in col.items.values():
+        if f.index and f.changes and _pure_drop(f.changes, f.index) and \
+                not any(c.kind == "check" for c in f.changes):
+            u = index_usage_of(sch, bundle, f.index)
+            if u is None or u["idx_scan"] > 0 or not _usage_complete(bundle):
+                f.ddl = _check_then_drop(f.index, f.changes, sch=sch)
     from . import safety as safety_mod
     import sys as _sys
-    safety_report = safety_mod.check(sch, patterns, col, _sys.modules[__name__], ps, bundle,
-                                     Finding)
+    safety_mod.annotate(sch, patterns, col, _sys.modules[__name__], ps, bundle, rules)
     flagged_all = {f.index for f in col.items.values() if f.index}
     sound = [x for x in sound if x.split(":")[0] not in flagged_all]
     findings = col.sorted()
@@ -1958,6 +2201,11 @@ def run(bundle, plans=None, schema_override=None):
         "settings": ps,
         "thresholds": THRESHOLDS,
         "lint_ran": lint_ok,
+        # Where the schema model came from: the scratch server's catalog, or the DDL text
+        # (with why, when a server ran but its catalog could not be read).
+        "schema_model": "catalog" if getattr(bundle, "catalog_schema", None) is not None
+        else "text",
+        "catalog_error": (plans or {}).get("catalog_error"),
         "schema": sch.to_dict(),
         "patterns": [_pat_out(p) for p in patterns],
         "findings": [dict(id=f.fid, basis_inputs=basis_of[f.rule],
@@ -1969,13 +2217,21 @@ def run(bundle, plans=None, schema_override=None):
         "replay": replay_summary,
         "probe_rules": sorted(probes_all()),
         "reconciliation": recon,
-        "safety": safety_report,
+        # Scrubbed by construction: gap records and the measured pass's text (errors, reasons)
+        # leave the engine as shapes and names, never values (server.scrub_record).
+        "measured": _scrubbed_measured(measured_pass),
+        "gaps": [server_mod.scrub_record(g)
+                 for g in path_gaps + gaps + list((measured_pass or {}).get("gaps") or [])],
         "preflight": dict(preflight_mod.summary(pf),
                           muted={r: {"inputs": ids,
                                      "withheld": sorted(col.withheld.get(r, ()))}
                                  for r, ids in sorted(pf["muted"].items())},
                           stages=[{"stage": s, "input": i} for s, i in pf["stages"]]),
     }
+    from . import pitfalls as pitfalls_mod
+    out["pitfalls"] = pitfalls_mod.detect(bundle, sch, out)
+    out["dossiers"] = dossier_mod.build(sch, patterns, out["findings"], rules, bundle,
+                                        sys.modules[__name__], ps)
     return out
 
 
@@ -2028,18 +2284,15 @@ def _fold_partition_copies(col, sch):
                    "them." % (h.index, ", ".join(sorted(names)), h.index))
 
 
-def _pure_drop(ddl, index):
-    """DDL that only drops the index (optionally after the idx_scan check), as opposed to a
+def _pure_drop(changes, index):
+    """Changes that only drop the index (optionally after the idx_scan check), as opposed to a
     rebuild or a re-key that drops it because something replaces it."""
-    lines = [l.strip() for l in ddl.splitlines() if l.strip()]
-    return bool(lines) and index in ddl and all(
-        re.match(r"(?i)DROP\s+INDEX\b", l) or re.match(r"(?i)ALTER\s+TABLE\s+.*\bDROP\s+"
-                                                        r"CONSTRAINT\b", l) or
-        l.startswith("-- first") and "idx_scan" in l for l in lines)
+    return all(c.kind in ("drop", "check") for c in changes) and \
+        any(c.kind == "drop" and c.name == index for c in changes)
 
 
 # What each rule family reads, for its "Basis" line; a rule in rules.json may say "uses".
-BASIS_USES = [("LINT-", ["schema"]), ("SAF", ["recommended", "schema"]),
+BASIS_USES = [("LINT-", ["schema"]),
               ("STA", ["schema", "pg_stats", "reltuples"]), ("IDX", ["schema", "workload"]),
               ("WRK003", ["schema", "index_usage"]), ("WRK", ["pss", "table_usage"]),
               ("SPL", ["schema", "reltuples", "tablets"]), ("CFG004", ["schema"]),
@@ -2049,7 +2302,7 @@ INPUT_NAMES = {"schema": "the schema DDL", "pg_stats": "pg_stats", "reltuples": 
                "pss": "pg_stat_statements", "queries": "the query list",
                "index_usage": "index usage counters", "table_usage": "table write counters",
                "settings": "pg_settings", "tablets": "tablet counts",
-               "capture_date": "the capture date", "recommended": "the recommended DDL"}
+               "capture_date": "the capture date"}
 
 
 def _basis_inputs(rule, rules, bundle):
@@ -2060,7 +2313,7 @@ def _basis_inputs(rule, rules, bundle):
             "pss": bool(bundle.pss), "queries": bool((bundle.queries_sql or "").strip()),
             "index_usage": bool(bundle.index_usage), "table_usage": bool(bundle.table_usage),
             "settings": bool(bundle.settings), "tablets": bool(bundle.tablets),
-            "capture_date": bool(bundle.meta.get("captured_at")), "recommended": True}
+            "capture_date": bool(bundle.meta.get("captured_at"))}
     out = []
     for u in uses:
         for x in (("pss", "queries") if u == "workload" else (u,)):
@@ -2074,14 +2327,16 @@ def _conflict_fix(sch, bundle, table, cols, target, uniq):
     needs an exact column-set match). A unique index on a subset already makes the target
     unique, so the statement should name that subset; otherwise a unique index on the target,
     hashed on a NOT NULL, high-cardinality column, because NULLs never conflict."""
-    subset = sorted((len(k), n, k) for t, k, w, n in uniq if t == table and w is None and
+    from . import safety as _saf
+    arb = _saf.arbiter_tables(sch, table)
+    subset = sorted((len(k), n, k) for t, k, w, n in uniq if t in arb and w is None and
                     k < target)
     if subset:
         _, name, k = subset[0]
-        return ("Change the statement to ON CONFLICT (%s). %s already makes (%s) unique, so "
-                "(%s) is unique too; the statement then takes the same conflicts, plus inserts "
-                "that today fail on %s with a unique violation." % (
-                    ", ".join(sorted(k)), name, ", ".join(sorted(k)), ", ".join(cols), name),
+        return ("%s already makes (%s) unique, so (%s) is unique too: with ON CONFLICT (%s) "
+                "the statement would take the same conflicts, plus inserts that today fail on %s "
+                "with a unique violation (the change_target option)." % (
+                    name, ", ".join(sorted(k)), ", ".join(cols), ", ".join(sorted(k)), name),
                 None)
     t = sch.tables[table]
     rows = table_rows(bundle, sch, table)
@@ -2094,33 +2349,337 @@ def _conflict_fix(sch, bundle, table, cols, target, uniq):
     nullable = [c for c in cols if not t.cols.get(c, {}).get("notnull", False)]
     name = schema_mod.ident("%s_%s_uniq" % (schema_mod.bare(table), "_".join(cols)))
     coloc = sch.is_colocated(table)
-    ddl = "CREATE UNIQUE INDEX CONCURRENTLY %s ON %s (%s);" % (
-        schema_mod.qi(name), schema_mod.qn(table),
-        schema_mod.key_group([schema_mod.qi(c) for c in order], coloc))
-    fix = ("Create a unique index on exactly (%s)%s, or change the target to the columns of an "
-           "existing unique index." % (
-               ", ".join(cols), " (range keys: the table is colocated)" if coloc else
-               ", hashed on %s so rows spread over tablets" % order[0]))
+    sql = schema_mod.new_index_sql(sch, name, table, schema_mod.key_group(
+        [schema_mod.qi(c) for c in order], coloc), unique=True)
+    ddl = [ch_mod.create(sql, name)] if sql else None
+    fix = ("A unique index on exactly (%s)%s would give the statement its arbiter (the "
+           "unique_index option); so would a target naming the columns of an existing unique "
+           "index." % (", ".join(cols), " (range keys: the table is colocated)" if coloc else
+                       ", hashed on %s so rows spread over tablets" % order[0]))
+    if ddl is None:
+        fix += (" %s is partitioned, and a unique index there must contain its partition key "
+                "(%s), so no index can be unique on exactly these columns: the target has to "
+                "include the partition key." % (table, ", ".join(t.partition_by[1])))
     if nullable:
-        fix += (" %s may be NULL, and NULLs never conflict, so a row with NULL there is "
-                "inserted again instead of updated: declare %s NOT NULL first." % (
-                    ", ".join(nullable), "it" if len(nullable) == 1 else "them"))
+        fix += (" %s may be NULL, and NULLs never conflict, so a row with NULL there would be "
+                "inserted again instead of updated unless %s NOT NULL." % (
+                    ", ".join(nullable), "it is" if len(nullable) == 1 else "they are"))
     return fix, ddl
 
 
-def _key_fix(idx, tname):
-    """Fix for a skewed or low-cardinality hash key that is also a guarantee: a primary key or
-    unique index is never dropped, only rebuilt on the same columns."""
+def _index_of_plan(sch, table, name):
+    """The schema's index (or primary key) a plan names, by its bare name on that table."""
+    for i in list(sch.indexes_on(table)):
+        if schema_mod.bare(i.name) == name:
+            return i
+    t = sch.tables.get(table)
+    return t.pk if t and t.pk and schema_mod.bare(t.pk.name) == name else None
+
+
+def _scrubbed_measured(m):
+    """The measured pass's result with its gaps, table reasons and pattern errors scrubbed."""
+    if not m:
+        return m
+    return dict(m, gaps=[server_mod.scrub_record(g) for g in m.get("gaps") or []],
+                tables={t: server_mod.scrub_record(v) for t, v in (m.get("tables") or {}).items()},
+                patterns=[server_mod.scrub_record(p) for p in m.get("patterns") or []])
+
+
+# The rules built from the access a pattern takes (access_record): their findings are
+# confirmed by replay when the replayed plan took that access.
+def access_standing(plans):
+    """plans.standing for the access the replayed plans give every access-path rule: one
+    access per pattern, so a release difference in any of those rules' tested behaviour keeps
+    the model's access for all of them."""
+    from . import plans as plans_mod
+    st = plans_mod.standing(plans, None)
+    vm = plans.get("version_match") or {}
+    drifted = sorted(set((vm.get("drift") or {}).get("rules", [])) & set(ACCESS_RULES))
+    if st["usable"] and drifted:
+        st = dict(st, usable=False, why=(
+            "not used: the tested behaviour of %s differs between %s and the replay image %s, "
+            "so the engine's model chose the access" % (
+                ", ".join(drifted), vm.get("customer_release"), vm.get("image_release"))))
+    elif st["usable"] and plans.get("statistics_missing"):
+        # Without the customer's statistics the planner chooses on defaults: its plan
+        # corroborates or disagrees with the engine's model, and never decides the access.
+        st = dict(st, usable=False, weak=True, why=(
+            "not used as the access: the replayed plans were chosen without %s, so the engine's "
+            "model chose the access; where the plan chose differently is listed under "
+            "Validation" % " or ".join(plans["statistics_missing"])))
+    return st
+
+
+ACCESS_RULES = ("CAP001", "CAP002", "CAP003", "CAP012", "CAP013", "CAP014", "CAP020",
+                "CAP021", "CAP031", "CAP040", "CAP050", "CAP051")
+
+
+def plan_access(plans, patterns, sch):
+    """(pattern id, table) -> the access the replayed plan takes on that table: {"index"
+    (schema name, or None for a sequential scan), "node", "scan", "idx", "binding" (the plan's
+    key binding, derive_binding of server_map; None when the index has expression keys)}; or
+    None when the plan's scans of the table disagree (a self-join, partitions read two ways)
+    or name an index the model does not know. A partition's scan counts for its partitioned
+    table, its index copy for the parent index."""
+    from . import server
+    out = {}
+    by_id = {e["id"]: e for e in plans.get("patterns") or [] if e.get("plan")}
+    for pat in patterns:
+        e = by_id.get(pat["id"])
+        if not e:
+            continue
+        tables = {t for sh in sqlshape.flatten(pat["shape"]) for t in sh.tables}
+        seen = {}
+        for sc in server.scans(e["plan"]):
+            rel = next((t for t in sch.tables if schema_mod.bare(t) == sc["table"] and (
+                not sc.get("schema") or (schema_mod.split_key(t)[0] or "public") ==
+                sc["schema"])), None)
+            table = rel
+            while table is not None and table not in tables:
+                table = sch.tables[table].partition_of if table in sch.tables else None
+            if table is None:
+                continue
+            idx = None
+            if sc["index"]:
+                idx = _index_of_plan(sch, rel, sc["index"])
+                if idx is not None and rel != table:  # a partition's copy: the parent's index
+                    parent = _parent_index(sch, idx, rel, table)
+                    t, pt = sch.tables.get(rel), sch.tables.get(table)
+                    rep = next((i for i in sch.indexes_on(table) if any(
+                        (sch.tables.get(x) or t).pk is i for x in pt.partitions)), None) \
+                        if parent is None and t is not None and idx is t.pk and pt else None
+                    if rep is not None:
+                        # No parent index: each partition read through its own primary key is
+                        # one access, named as the model names it (a partition's key).
+                        seen.setdefault(table, []).append(
+                            {"index": rep.name, "node": sc["node"], "scan": sc, "idx": rep,
+                             "binding": None, "sig": ("own primary key", sc["node"])})
+                        continue
+                    idx = parent
+            if sc["index"] and idx is None:
+                seen.setdefault(table, []).append(None)  # an index the model does not know
+                continue
+            binding = None
+            if idx is not None and not any(k.col is None for k in idx.keys):
+                binding = derive_binding(server.server_map(sc, idx), len(idx.hash_cols))
+            seen.setdefault(table, []).append(
+                {"index": idx.name if idx else None, "node": sc["node"], "scan": sc,
+                 "idx": idx, "binding": binding})
+        for table, recs in seen.items():
+            sigs = {r.get("sig") or (r["index"], r["node"]) if r else None for r in recs}
+            out[(pat["id"], table)] = recs[0] if len(sigs) == 1 and None not in sigs else None
+    return out
+
+
+def _parent_index(sch, idx, rel, table):
+    """The partitioned table's index that `idx` (on partition `rel`) is a copy of: its parent
+    index (which may be the parent's primary key), or the parent's primary key for the
+    partition's own; None when neither is known."""
+    pt, t = sch.tables.get(table), sch.tables.get(rel)
+    if idx.parent:
+        if idx.parent in sch.indexes:
+            return sch.indexes[idx.parent]
+        if pt is not None and pt.pk is not None and \
+                schema_mod.bare(pt.pk.name) == schema_mod.bare(idx.parent):
+            return pt.pk
+    if t is not None and idx is t.pk and pt is not None:
+        return pt.pk
+    return None
+
+
+def _server_bindings(plans, patterns, sch, bundle, col, recon, planned=None):
+    """Record what the replayed plans say that the model does not read the same way: the
+    statement rewrites the server needed, conditions the reader could not read, and each key
+    column the model binds differently from the plan (bind.pred). The access itself (index,
+    binding) comes from the plan in access_record; nothing here changes a finding."""
+    from . import server
+    gaps = []
+    planned = planned if planned is not None else plan_access(plans, patterns, sch)
+    by_id = {e["id"]: e for e in plans.get("patterns") or [] if e.get("plan")}
+    for pat in patterns:
+        e = by_id.get(pat["id"])
+        if not e:
+            continue
+        for note in server.statement(pat["query"])[1]:
+            gaps.append({"layer": "statement", "pattern": pat["id"],
+                         "model": "the statement as captured", "server": note})
+        for r in server.residue(e["plan"]):
+            gaps.append({"layer": "bind.reader", "pattern": pat["id"],
+                         "server": r[:200], "model": "the condition reader could not read it"})
+        shapes = {t: sh for sh in sqlshape.flatten(pat["shape"]) for t in sh.tables}
+        for table, sh in sorted(shapes.items()):
+            pa = planned.get((pat["id"], table))
+            if not pa or pa["idx"] is None or pa["binding"] is None:
+                continue
+            idx = pa["idx"]
+            model = binding_map(idx, _pred_index(sh.preds_for(table)))
+            plan_cols = pa["binding"]["cols"]
+            for a in pat.get("access", []):
+                if a["table"] == table:
+                    a["plan_binding"] = {"index": idx.name, "cols": plan_cols}
+            diffs = server.compare_maps(model["cols"], plan_cols)
+            if diffs:
+                gaps.append({"layer": "bind.pred", "pattern": pat["id"], "table": table,
+                             "index": idx.name, "columns": diffs})
+    return gaps
+
+
+def best_index(paths, best):
+    """The index of the chosen path's evaluation."""
+    return next((i for i, r in paths if r is best), None) or \
+        next(i for i, r in paths if r.get("index") == best.get("index"))
+
+
+def _cap001(sch, table, i, r, ops, pat, sev_shift, size_txt):
+    """CAP001: the pattern filters the table but does not bind all of index i's hash group."""
+    bound = [k for k in i.hash_cols if k.label not in r["hash_missing"]]
+    rest = [k for k in i.keys if k not in bound]
+    newkey = "(%s) HASH%s" % (", ".join(k.sql for k in bound), "".join(
+        ", %s %s" % (k.sql, "ASC" if k.mode == "HASH" else k.mode)
+        for k in rest))
+    ranged_hash = any(ops.get(_keyid(k), set()) & set(BIND_RANGE)
+                      for k in i.hash_cols)
+    if ranged_hash:
+        hc = ", ".join(k.sql for k in i.hash_cols)
+        c1fix = ("A range on a hash column cannot seek. Chunked scans or "
+                 "exports that split the work on yb_hash_code(%s) ranges "
+                 "(0..65535) would seek, as would equality on every hash "
+                 "column." % hc)
+        c1ddl = None
+    elif i.is_pk:
+        c1fix = ("A primary key of (%s) on %s would keep the same "
+                 "uniqueness, and the pattern would then bind the whole hash "
+                 "group (the rekey option, a table swap)." % (newkey, table))
+        c1ddl = [_rekey_comment(table, newkey, sch.is_colocated(table),
+                                fks=sch.fks_referencing(table))]
+    else:
+        c1fix = ("An index whose hash group is exactly the bound columns, "
+                 "(%s), would serve the pattern (the index_bound option)."
+                 % newkey)
+        c1name = "%s_%s" % (schema_mod.bare(table), "_".join(
+            re.sub(r"\W+", "_", k.label).strip("_") for k in bound))
+        c1ddl = [ch_mod.create(schema_mod.new_index_sql(
+            sch, c1name, table, newkey), c1name)]
+    return Finding("CAP001", shift("high", sev_shift), "probable",
+                   "%s on %s" % (i.name, table),
+                   "%s filters %s but does not bind %s of %s's hash group "
+                   "[%s] with equality; no other index serves it%s." % (
+                       pat["id"], table, ", ".join(r["hash_missing"]),
+                       i.name, ", ".join(k.label for k in i.hash_cols),
+                       size_txt),
+                   [pat["id"]], table=table, index=i.name, fix=c1fix, ddl=c1ddl)
+
+
+def access_record(sch, table, rows, sh, ops, paths, planned=None):
+    """The access a pattern takes on `table`: (record, the chosen path's evaluation or None,
+    the ordered walk used when no path serves, the model's own choice). The record is what
+    the review shows and what later rules read (pat["access"]). With `planned` (the replayed
+    plan's access, plan_access) the plan's choice is the access, source "plan": its index's
+    evaluation with the plan's key binding and covering, or no path for a sequential scan;
+    otherwise the model's choice, source "model"."""
+    model_best = choose([r for _, r in paths], limit=bool(sh.limit))
+    best, source = model_best, "model"
+    if planned is not None:
+        if planned["index"] is None:  # a sequential scan
+            best, source = None, "plan"
+        else:
+            match = [r for i, r in paths if i.name == planned["index"]]
+            if match:
+                best, source = match[0], "plan"
+                if planned["binding"] is not None:
+                    best["binding"] = planned["binding"]
+                if "covering" in best:  # an evaluated path: the node says if it fetches rows
+                    best["covering"] = planned["node"] == "Index Only Scan"
+    walk = ordered_walk(sch, table, ops, sh) if best is None and source == "model" else None
+    acc = {"table": table, "rows": rows,
+           "path": best["index"] if best else (walk.name if walk else None),
+           "walk": bool(walk),
+           "bound": best["bound"] if best else 0,
+           "point": bool(best and best["full_unique"]),
+           "order_ok": best.get("order_ok") if best else None,
+           "covering": best.get("covering") if best else None,
+           "skip_scan": bool(best and best["skip_scan"]),
+           "binding": best.get("binding") if best else None,
+           "source": source}
+    return acc, best, walk, model_best
+
+
+def _key_gap(sch, bundle, table, rows, pat, sh, best, paths, sev_shift, size_txt):
+    """CAP014: the pattern binds a key column after an unbound or only filtered one, so DocDB
+    reaches it by seeking under every distinct value of the gap. None when there is no gap."""
+    m = best.get("binding") if best else None
+    if sh.kind == "insert" or not m or not m["gap"] or not m["after_gap"]:
+        return None
+    idx = best_index(paths, best)
+    t = sch.tables[table]
+    nd = []
+    for c in m["gap"]:
+        st = col_stats(bundle, sch, table, c)
+        nd.append(n_distinct_abs(st, rows) if st else None)
+    known = all(x is not None for x in nd)
+    distinct = 1
+    for x in nd if known else ():
+        distinct *= max(1, int(x))
+    gap_txt, after_txt = ", ".join(m["gap"]), ", ".join(m["after_gap"])
+    count_txt = (" (up to ~%s distinct values, from pg_stats)" % _fmt(distinct)) if known \
+        else " (their distinct count is unknown without pg_stats)"
+    f = Finding("CAP014", shift("low" if known and distinct <= 16 else "medium", sev_shift),
+                "probable", "%s on %s" % (idx.name, table),
+                "%s binds %s of %s, then %s, but not %s between them: DocDB reaches the rows by "
+                "seeking under every distinct value of (%s) within the bound prefix%s%s." % (
+                    pat["id"], ", ".join(c["col"] for c in m["cols"][:m["prefix"]]) or "nothing",
+                    idx.name, after_txt, gap_txt, gap_txt, count_txt, size_txt),
+                [pat["id"]], table=table, index=idx.name,
+                fix="The read costs a seek per distinct value of (%s) under the bound prefix, "
+                    "not per row returned; the options are a key with %s before %s, an index "
+                    "that leads with the bound columns, or keeping it." % (
+                        gap_txt, after_txt, gap_txt))
+    # The sketch: the same key with the columns bound after the gap moved before it.
+    moved = [k for k in idx.keys[m["prefix"]:] if k.label in m["after_gap"]]
+    order = list(idx.keys[:m["prefix"]]) + moved + [k for k in idx.keys[m["prefix"]:]
+                                                   if k not in moved]
+    hk = idx.hash_cols
+    rng = [k for k in order if k not in hk]
+    keys = ("(%s) HASH" % ", ".join(k.sql for k in hk) if hk else "") + "".join(
+        ("%s%s %s" % (", " if (hk or n) else "", k.sql, k.mode if k.mode in ("ASC", "DESC")
+                      else "ASC")) for n, k in enumerate(rng))
+    if idx.is_pk:
+        f.excluded_options = ("reorder",)
+        f.ddl = [_rekey_comment(table, keys, sch.is_colocated(table),
+                                fks=sch.fks_referencing(table))]
+    else:
+        f.excluded_options = ("rekey",)
+        f.ddl = ch_mod.replace(idx, schema_mod.ident(schema_mod.bare(idx.name) + "_bound"),
+                               table=table, keys=keys,
+                               colocated=sch.is_colocated(table),
+                               partitioned=bool(t.partition_by))
+    return f
+
+
+def _key_fix(idx, tname, hot_apart=False):
+    """Text for a skewed or low-cardinality hash key that is also a guarantee: a primary key or
+    unique index is never offered a drop, and the text says what each option it is offered
+    would do to the guarantee (none of them is modelled). hot_apart: the rule also offers
+    separate_hot_value (STA003)."""
     cols = ", ".join(k.label for k in idx.keys)
     if idx.is_pk:
         return ("%s is the primary key of %s, so it cannot be dropped. A different hash group "
-                "means rebuilding the table with a new primary key on the same columns (%s), which "
-                "keeps them unique; consider it only if the hot patterns also bind a "
-                "high-cardinality column that can join the hash group." % (idx.name, tname, cols))
+                "means rebuilding the table with a new primary key: on the same columns (%s) "
+                "it keeps them unique; with an added high-cardinality column (the composite "
+                "option) only the wider key would be, and (%s) would need a unique index of its "
+                "own. It helps only if the hot patterns also bind that column." % (
+                    idx.name, tname, cols, cols))
     if idx.unique:
-        return ("%s enforces uniqueness on (%s), so do not drop it. To change its hash group, "
-                "create a UNIQUE index on the same columns with the new hash group, then drop this "
-                "one; worth it only if the hot patterns bind the added column." % (idx.name, cols))
+        return ("%s enforces uniqueness on (%s), so it stays: no drop is offered. The "
+                "composite option adds a high-cardinality column to the hash group; on this "
+                "index that would make only the wider key unique, so (%s) would then need "
+                "another unique index on exactly those columns. %sIt helps only if the hot "
+                "patterns bind the added column, and the foreign keys and ON CONFLICT "
+                "statements that rely on this index are listed in its area." % (
+                    idx.name, cols, cols,
+                    "A partial index that leaves the dominant value out (the separate_hot_value "
+                    "option) would no longer keep that value's rows unique. " if hot_apart
+                    else ""))
     return None
 
 
@@ -2161,10 +2720,8 @@ def _insert_ordered_hint(t, col):
 def _replace_ddl(idx, suffix, tname, t, colocated, **change):
     """Create the derived replacement, then drop the original (YSQL rejects DROP INDEX
     CONCURRENTLY)."""
-    new = schema_mod.ident(idx.name + suffix)
-    return schema_mod.index_sql(idx, new, tname, colocated=colocated,
-                                partitioned=bool(t.partition_by), **change) + "\n" + \
-        schema_mod.drop_sql(idx, new)
+    return ch_mod.replace(idx, schema_mod.ident(idx.name + suffix), table=tname,
+                          colocated=colocated, partitioned=bool(t.partition_by), **change)
 
 
 def _bucket_ddl(idx, tname, t, col, buckets=16):

@@ -3,7 +3,10 @@
 -- Run from an empty directory, connected to the application database:
 --   ysqlsh -h <host> -U <user> -d <db> -f collect.sql
 --   ysql_dump -h <host> -U <user> -d <db> --schema-only --include-yb-metadata > schema.sql
--- Then pass the directory to: python3 scripts/yb-model.py analyze <dir>
+-- Then review the directory: python3 scripts/yb-model.py preflight <dir>, and
+-- python3 scripts/yb-model.py review <dir> (see SKILL.md and references/intake.md).
+-- For complete usage counters, run this once per node into its own folder (node1/, ...),
+-- connected to that node's own address rather than localhost.
 --
 -- Each \copy writes one CSV in the current directory. A query that fails on an older release
 -- (for example a missing column) only skips that file. pg_stat_statements must be installed in

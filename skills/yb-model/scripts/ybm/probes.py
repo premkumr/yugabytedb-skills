@@ -2,7 +2,7 @@
 
 A rule that claims how YugabyteDB executes something (not just which plan it picks) carries a
 `probe` in rules/rules.json: setup SQL that builds a few thousand generated rows, named cases
-(EXPLAIN (ANALYZE, DIST) of literal queries), `applies` checks (the planner took the path the
+(EXPLAIN (ANALYZE, DIST) of literal queries; with DEBUG when a check reads seeks), `applies` checks (the planner took the path the
 rule is about) and `holds` checks (the claimed behaviour happened). Rows are generated, not
 injected, because the claims are about execution counters (rows scanned, rechecks), which
 injected statistics cannot produce.
@@ -38,9 +38,27 @@ def _walk(node, out):
     return out
 
 
+def _metric(doc, nodes, key):
+    if key in (doc.get("Read Metrics") or {}):
+        return doc["Read Metrics"][key]
+    found = [n["Read Metrics"][key] for n in nodes if key in (n.get("Read Metrics") or {})]
+    return sum(found) if found else None
+
+
+def _seeks(doc, nodes):
+    """DocDB seeks from EXPLAIN (..., DEBUG): the statement's Read Metrics, or the scans'; None
+    when the release reports no such counter."""
+    key = "Metric rocksdb_number_db_seek"
+    if key in (doc.get("Read Metrics") or {}):
+        return doc["Read Metrics"][key]
+    found = [n["Read Metrics"][key] for n in nodes if key in (n.get("Read Metrics") or {})]
+    return sum(found) if found else None
+
+
 def metrics(plan_json):
     """Counters from EXPLAIN (ANALYZE, DIST, FORMAT JSON) that the checks may use."""
-    top = plan_json[0]["Plan"] if isinstance(plan_json, list) else plan_json["Plan"]
+    doc = plan_json[0] if isinstance(plan_json, list) else plan_json
+    top = doc["Plan"]
     nodes = _walk(top, [])
     idx_rows = sum(n.get("Storage Index Rows Scanned", 0) or 0 for n in nodes)
     tab_rows = sum(n.get("Storage Table Rows Scanned", 0) or 0 for n in nodes)
@@ -52,7 +70,10 @@ def metrics(plan_json):
             "filtered": sum(n.get("Rows Removed by Filter", 0) or 0 for n in nodes),
             "sorted": any(n.get("Node Type") in ("Sort", "Incremental Sort") for n in nodes),
             "scan": scans[0].get("Node Type") if scans else None,
-            "index": scans[0].get("Index Name") if scans else None}
+            "index": scans[0].get("Index Name") if scans else None,
+            "seeks": _seeks(doc, nodes),
+            "nexts": _metric(doc, nodes, "Metric rocksdb_number_db_next"),
+            "read_requests": doc.get("Storage Read Requests")}
 
 
 # --- checks: a tiny, safe expression language over case metrics -----------------------------
@@ -81,7 +102,7 @@ def parse_check(expr, cases):
 
 
 METRICS = ("returned", "scanned", "index_scanned", "table_scanned", "rechecked", "filtered",
-           "sorted", "scan", "index")
+           "sorted", "scan", "index", "seeks", "nexts", "read_requests")
 
 
 def judge(probe, case_metrics):
@@ -115,16 +136,21 @@ def run(container, rule_ids, settings_sql):
             out[rid] = {"verdict": "inconclusive", "detail": "setup failed: " + err[0],
                         "cases": {}}
             continue
+        # Seek counters need EXPLAIN's DEBUG option; only probes that check them ask for it.
+        debug = any(".seeks" in e for e in p.get("applies", []) + p["holds"])
         cases, failed = {}, None
         for name, q in p["cases"].items():
-            r = container.sql(settings_sql + "EXPLAIN (ANALYZE, DIST, FORMAT JSON) %s;\n" % q,
-                              db="ybm_probe", flags=("-tA",))
+            r = container.sql(settings_sql + "EXPLAIN (ANALYZE, DIST%s, FORMAT JSON) %s;\n" % (
+                ", DEBUG" if debug else "", q), db="ybm_probe", flags=("-tA",))
             txt = r.stdout.strip()
             try:
                 cases[name] = metrics(json.loads(txt[txt.index("["):]) if "[" in txt else None)
             except (ValueError, TypeError, KeyError):
                 failed = "case %s: %s" % (name, (r.stderr.strip() or txt)[:300])
                 break
+        if not failed and debug and any(m is None or m.get("seeks") is None
+                                        for m in cases.values()):
+            failed = "this release reports no seek counters (EXPLAIN DEBUG)"
         if failed:
             out[rid] = {"verdict": "inconclusive", "detail": failed, "cases": cases}
             continue
@@ -152,12 +178,23 @@ def apply(col, plans, recon):
         return
     vm = plans.get("version_match") or {}
     rel = vm.get("image_release") or plans.get("version")
-    where = rel if vm.get("exact", True) else "%s (nearest image to %s)" % (
-        rel, vm.get("customer_release") or vm.get("customer"))
+    cust = vm.get("customer_release") or vm.get("customer")
+    where = rel if vm.get("exact", True) else "%s (nearest image to %s)" % (rel, cust)
+    # As in replay (plans.reconcile): on another release, a refutation stands only when the
+    # differences between the releases are known and do not touch this rule.
+    drift_unknown = not vm.get("exact", True) and not vm.get("drift_known", True)
+    drifted = set((vm.get("drift") or {}).get("rules", []))
     for key in sorted(k for k in col.items if k[0] in res):
         f, r = col.items[key], res[key[0]]
         txt = describe(key[0], r)
-        if r["verdict"] == "holds":
+        if r["verdict"] in ("holds", "refuted") and (drift_unknown or key[0] in drifted):
+            f.verified = ("not verified: the rule's probe %s on %s (%s), but %s, so it neither "
+                          "confirms nor refutes the finding" % (
+                              "held" if r["verdict"] == "holds" else "did not hold", where, txt,
+                              "the differences between the releases are unknown (no release "
+                              "facts cached)" if drift_unknown else
+                              "this rule's tested behaviour differs between the releases"))
+        elif r["verdict"] == "holds":
             f.verified = "holds on %s: %s" % (where, txt)
         elif r["verdict"] == "refuted":
             if plans.get("assumed_settings"):
@@ -179,9 +216,10 @@ def describe(rid, res):
     """One line for the report, from the measured counters."""
     parts = []
     for name, m in sorted(res.get("cases", {}).items()):
-        parts.append("%s: %s rows scanned for %s returned%s%s" % (
+        parts.append("%s: %s rows scanned for %s returned%s%s%s" % (
             name, m["scanned"], m["returned"],
             (", %s removed by recheck" % m["rechecked"]) if m["rechecked"] else "",
+            (", %d seeks" % m["seeks"]) if m.get("seeks") is not None else "",
             (" via %s" % m["index"]) if m["index"] else (" (%s)" % m["scan"] if m["scan"]
                                                           else "")))
     return "; ".join(parts)

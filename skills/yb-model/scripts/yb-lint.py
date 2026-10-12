@@ -515,6 +515,24 @@ def check_index(st, findings, index_registry, table_cols=None, table_pk=None):
         if nullable:
             names = ", ".join(nullable)
             guard = " AND ".join(f"{c} IS NOT NULL" for c in nullable)
+            # NOT NULL is declared on columns: for an expression key, on its input columns.
+            plain = [c for c in nullable if re.fullmatch(r"[\w$]+", c)]
+            inputs = [
+                w
+                for e in nullable
+                if e not in plain
+                for w in re.findall(r"[A-Za-z_][\w$]*", e)
+                if w in decls
+            ]
+            declare = list(dict.fromkeys(plain + inputs))
+            exprs = [e for e in nullable if e not in plain]
+            decl = (
+                f"Declare {', '.join(declare)} NOT NULL if they are never NULL"
+                + (f" (the input column(s) of {', '.join(exprs)})" if exprs and inputs else "")
+                + ", or make"
+                if declare
+                else "Make"
+            )
             findings.append(
                 Finding(
                     "YB027",
@@ -523,8 +541,7 @@ def check_index(st, findings, index_registry, table_cols=None, table_pk=None):
                     f"{iname}: unique index on nullable column(s) {names}. NULL is distinct "
                     "from NULL, so many NULL rows are permitted and Voyager live migration "
                     "can raise false conflicts on it.",
-                    f"Declare {names} NOT NULL if they are never NULL, or make the index "
-                    f"partial: WHERE {guard}.",
+                    f"{decl} the index partial: WHERE {guard}.",
                 )
             )
 
@@ -589,8 +606,8 @@ def cross_checks(index_registry, findings, max_indexes):
                             f"{table}: index '{a_name}' ({cols}) duplicates '{b[0]}': same key "
                             "columns, layout and sort order, not unique, and its INCLUDE "
                             "columns are covered.",
-                            "Confirm idx_scan = 0 and that no hint or constraint names it, "
-                            f"then DROP INDEX {a_name}.",
+                            f"Probably redundant: if idx_scan is 0 on every node and no hint or "
+                            f"constraint names it, removing {a_name} saves its write cost.",
                         )
                     )
                 else:
@@ -602,8 +619,8 @@ def cross_checks(index_registry, findings, max_indexes):
                             f"{table}: index '{a_name}' ({cols}) is a prefix of '{b[0]}' with "
                             "the same hash group and sort order, is not unique, and its "
                             "INCLUDE columns are covered, so it is probably redundant.",
-                            "Confirm idx_scan = 0 and that no hint or constraint names it, "
-                            f"then DROP INDEX {a_name}.",
+                            f"Probably redundant: if idx_scan is 0 on every node and no hint or "
+                            f"constraint names it, removing {a_name} saves its write cost.",
                         )
                     )
 

@@ -23,14 +23,16 @@ customer's own data, and their findings say which inputs they were computed from
 inputs give the same findings, severities, ranking, DDL and chat message, whichever model runs
 the skill.
 
-Your job is to collect the inputs, run the engine, add only the context the engine cannot know
-and say what was not verified. **Do not add, drop, re-rank, re-word or re-grade findings yourself.** If you
+Your job is to collect the inputs, run the engine, add only the context the engine cannot know,
+suggest a direction per area from the options the findings offer (step 4b), and say what was
+not verified. **Do not add, drop, re-rank, re-word or re-grade findings yourself.** If you
 believe a finding is wrong or something is missing, write it under *Reviewer notes* with the
-finding ID, or "not in engine". Never edit the findings table by hand.
+finding ID, or "not in engine". Never edit the findings table by hand. The direction is yours
+and is labelled as such; the findings, their facts and their options are the engine's.
 
 | File | Read when |
 |---|---|
-| `references/pitfalls.md` | Before every review, and whenever something does not work as expected. Things to be wary of. |
+| `references/pitfalls.md` | Before every review (`yb-model.py pitfall list` adds your own entries), and whenever something does not work as expected. Known gaps, each with the engine's status. |
 | `references/engine.md` | Step 4. What each output field means; how to read replay results. |
 | `references/intake.md` | Step 1. What to ask for, and the exact capture commands. |
 | `references/validation.md` | Step 5. Live-cluster checks the engine cannot do. |
@@ -42,17 +44,18 @@ finding ID, or "not in engine". Never edit the findings table by hand.
 Copy this checklist and tick it off.
 
 ```
-- [ ] 0. references/pitfalls.md read
+- [ ] 0. references/pitfalls.md and your own list read (`yb-model.py pitfall list`)
 - [ ] 1. Inputs gathered into one directory
 - [ ] 1b. Preflight ran; if it asked, the user said yes or no
 - [ ] 1c. Any input the engine could not read converted (a copy) and named in NOTES
 - [ ] 2. Engine ran (review.md, review.json and chat.md exist)
 - [ ] 3. Replay ran, or the reason it did not is recorded
 - [ ] 4. User context added to review.md, or the NOTES line deleted
+- [ ] 4b. Decisions consolidated per area in plan.json and checked (`yb-model.py plan`), at most one revision; the user decides
 - [ ] 5. Limitations stated
 - [ ] 6. (optional) Second pass recorded under Reviewer notes
 - [ ] 7. chat.md pasted as the chat message
-- [ ] 8. Anything that did not work as expected written to pitfall-candidates.md
+- [ ] 8. Anything that did not work as expected added with `yb-model.py pitfall add`
 ```
 
 ### 1. Gather
@@ -146,7 +149,9 @@ and prints why when it cannot. Replay does four things:
 3. Runs `EXPLAIN` on every pattern.
 4. Runs the **probe** of every fired rule that has one: a few thousand generated rows and
    `EXPLAIN (ANALYZE, DIST)`, checking that the rule's mechanism holds on that release. A
-   refuted rule's finding is withdrawn; the report says which. Probes never use customer data
+   refuted rule's finding is withdrawn, and the report says which, unless the image is another
+   release with unknown or changed behaviour for that rule, or the planner settings were
+   assumed: then the finding stays, marked unverified or disputed. Probes never use customer data
    and store nothing.
 
 Never `docker pull` without asking: the image is a download of about 1 GB. If the user
@@ -167,27 +172,42 @@ If the engine cannot run on this surface, say so and review by hand with
 
 `review.md` always has these sections, in this order. Do not reorder or drop them:
 
-1. **Headline**: the worst schema finding, its cost and the first action (engine-written).
+1. **Headline**: the worst schema finding, its cost and where to start (engine-written).
 2. **What this review is based on**: inputs, release, where each planner setting came from.
 3. **Assumptions and unknowns**: missing inputs, settings that depend on how the cluster was
    deployed, features that do not exist on this release, and the **Muted checks** table
    (which rules were muted or weakened by which missing input, and the candidates withheld).
 4. **Access patterns**: P1..Pn with weight, calls, time share, access path.
-5. **Findings**: schema findings, ranked, each with fact, mechanism, fix and its basis (the
-   regress test that pins it, or "computed from the bundle").
-6. **Disputed by replay (planner settings assumed)**: findings that replay disagreed with
-   while running under assumed planner settings (the bundle had no pg_settings). They are
-   kept, because the customer's real settings may differ, but stay out of the recommended
-   DDL and action items. Say so plainly; collecting `ybm_settings.csv` settles them.
-7. **Workload hygiene (confirm with the application team)**: how the application uses the
+5. **By area**: the findings grouped by the tables a change can reach (partitions with their
+   parent, tables joined by a foreign key). Per area: **suggestions** (the only finding on an
+   object, whose option only adds something, such as a new index, and was checked alone with
+   no cost found; for the user to confirm, with its reasons), **decisions** (an object several
+   findings name, or an option that drops, rebuilds or re-keys something, has a cost or could
+   not be checked), notes, what any change there must keep true (unique guarantees, foreign
+   keys, ON CONFLICT targets, the indexes ranked patterns read through) and the tensions.
+6. **Findings**: schema findings, ranked, each with fact, mechanism, why it matters here, the
+   options its rule offers with what checking each one found, and its basis (the regress
+   test that pins it, or "computed from the bundle").
+7. **Options by rule**: for each rule with findings, its options once, each with when it fits,
+   its trade-off and what to check first.
+8. **Disputed by replay (settings assumed or no statistics)**: sort and partition findings
+   (CAP010, CAP011, CAP030) that replay disagreed with while running under assumed planner
+   settings or without statistics. They are kept, because the customer's real planner may
+   differ, but stay out of the suggestions and decisions. A probe may dispute any probed
+   finding; replay never disputes access paths: the plan's access stands, labelled, and the
+   model's other choices are listed under Validation. Collecting `ybm_settings.csv` settles both.
+9. **Workload hygiene (confirm with the application team)**: how the application uses the
    database (lookups that find nothing, UPDATEs that match nothing or rewrite every column,
    full-table counts, fan-out, planning time). Not schema defects; hand these to the app
    owners.
-8. **What is already sound.**
-9. **Recommended DDL**, after the safety pass.
-10. **Safety check of the recommendations.**
-11. **Validation and limitations**, including replay and the self-check.
-12. **Action items**, schema first, then the application team.
+10. **What is already sound.**
+11. **Validation and limitations**, including how options were checked, replay and the
+    self-check.
+12. **Decisions to make**, schema first, then the application team: per finding, its
+    suggestion with the reason, or the options to decide between.
+
+The review prints no DDL. `python3 scripts/yb-model.py sketch <bundle> <finding> --option
+<id>` prints it for an option the user has chosen, with what checking it found.
 
 ### Versions
 
@@ -223,24 +243,87 @@ an upgraded universe keeps `legacy_mode`). The engine reads these facts from a l
 ### 3. Replay
 
 If replay failed or was skipped, give the reason in one sentence under Validation. Without
-replay, access-path findings stay `probable`. Do not upgrade them by reasoning.
+replay, access-path findings stay `probable`. Do not upgrade them by reasoning. A review without
+a scratch server is static only: the engine puts a warning at the top of `chat.md` and
+`review.md` that nothing was proven on a server and accuracy is significantly reduced. Keep it,
+and offer the user the proven review: a local `yugabytedb/yugabyte` image of their release
+(ask before pulling one), then `review --replay --measure`.
+
+With replay, add `--measure`: the engine runs the reads on a small generated sample and reports
+what DocDB did. A MEAS001 finding ("unexplained, measured") is a measurement no rule explains:
+present it as a lead, never as a diagnosis. You may write one hypothesis for it under Reviewer
+notes, labelled as such, and record it with `yb-model.py pitfall add` so the gap is not lost.
 
 ### 4. Add context
 
-The engine writes the headline (worst finding, its cost, first action) and the chat message.
+The engine writes the headline (worst finding, its cost, where to start) and the chat message.
 Keep both as they are. Replace the `<!-- NOTES ... -->` line with at most two sentences of
 context that only the user gave you, or delete the line. Do not write DDL, numbers or estimates of your own, and do not
 add causes or effects (contention, latency, retries) that no finding states: every
 statement, figure and claim in the review comes from the engine. Add a `## Reviewer notes` section
-only when step 6 produced something or you disagree with a finding.
+only when a binding map below, step 6 or your disagreement with a finding gives it a line.
 
-The report ends with a **Safety check** table: the engine applied every recommended DDL
-to a copy of the schema and checked uniqueness, ON CONFLICT targets and the plans of every
-ranked pattern. Rows marked `amended` already include the fix (for example an added UNIQUE
-index). Never recommend DDL that bypasses a `warn` row; point the user at the SAF finding.
-Replacement indexes keep the original's UNIQUE, INCLUDE, predicate and SPLIT, and drops are
-plain `DROP INDEX` (YSQL rejects `DROP INDEX CONCURRENTLY`) or `ALTER TABLE ... DROP
-CONSTRAINT` for a constraint's index. Do not rewrite them.
+Read the access table's key binding maps (`[= = - =]`; review.json `access.binding`). They
+are engine output, so you may point at them. For each pattern whose map shows a `-` or an `f`
+before a `=`, `in` or `<>`, and that no finding names, add one line under Reviewer notes:
+the pattern id, the map as printed, and "not engine-checked". Quote the map; do not estimate
+rows, seeks or cost, and do not read the SQL for more.
+
+Present each finding as the reason something matters and the options to choose from. The
+engine checked every option it can model alone and shows what it would lose next to it ("costs:
+..."); it never changes an option to hide a cost, never chooses one, and no finding settles
+another. Do not turn an option into an instruction, and never write DDL yourself.
+
+### 4b. Consolidate each area, then decide with the user
+
+Read the review's **By area** section (review.json `dossiers`). Its **suggestions** are
+additive and checked clean; they go to the user as the engine made them, for confirmation.
+Anything destructive is always a **decision**. For each area with a **decision** at medium or
+above, consolidate: read every finding on its objects, what must stay true and the tensions,
+and work out what is wrong with how that part of the schema is designed, as a whole, and
+which options make most sense together given how the application will grow. Write it to
+`plan.json` next to the review:
+
+```json
+{"areas": [{"area": "<any table of the area>",
+            "diagnosis": "what is wrong with this part of the schema, as a whole",
+            "direction": "two to four sentences: the options you suggest together, and why",
+            "choices": {"F5": "partial", "F9": "keep"},
+            "questions": ["what only the user can confirm or decide"]}]}
+```
+
+Choose for each finding in a decision one of its option ids (listed under **Options by
+rule**; every rule has `keep`). Several findings on one object usually settle with one
+change: choose it once, and `keep` or an application-side option for the others. Prefer an
+option the engine checked and found no cost in; when the right choice depends on something
+you do not know (growth, what NULL means, which jobs run monthly), choose the least
+destructive one and put the question to the user. A plan may also override a suggestion by
+choosing another option for its finding.
+
+Then check it:
+
+```bash
+python3 scripts/yb-model.py plan <bundle> <bundle>/plan.json
+```
+
+The engine applies your choices and every area's suggestions together and reports what the
+combination would break: lost uniqueness or ON CONFLICT targets, a foreign key left without
+its index, a plan regression on a ranked pattern, an index in use dropped, two choices that
+change one object. It writes `plan.md` and adds one line to `chat.md`. Exit 0: no conflict.
+Exit 1: conflicts, or choices it could not check. Revise `plan.json` **once** to remove the
+conflicts and check again; what remains, and every unchecked choice, is for the user. Exit 2:
+the plan could not be checked. Read the error lines (stderr, and "The plan has errors" in
+`plan.md`): a name that does not exist, a disputed finding chosen, a field of the wrong shape,
+or a review, plan, bundle or scratch server that could not be read. Fix what they name. Never
+edit `plan.md` by hand.
+
+**Then it is the user's call.** Walk the user through the decisions in `plan.md`: for each,
+the options with their trade-offs and costs, and your suggested direction. The user may know
+more about where the application is going, and may choose another option, a destructive one
+included; record their choices in `plan.json` and run `plan` again so the engine checks what
+they chose. Only then, and only for options they chose, print the DDL with `yb-model.py
+sketch <bundle> <finding> --option <id>`, and remind them to parse-check it on a scratch
+instance of their release before running it on their cluster.
 
 ### 5. Limitations
 
@@ -257,8 +340,9 @@ verified by the engine". Do not merge these into the findings table.
 ### 7. Deliver
 
 Paste `chat.md` as your chat message, unchanged. It holds the headline, the top three findings
-with their fixes, the review level and, for an incomplete review, the missing inputs and the
-withheld candidates, and it ends with the path to `review.md`. You may add at most two
+with their options, the review level and, for an incomplete review, the missing inputs and the
+withheld candidates, then the path to `plan.md` with the engine's check of your direction, and
+it ends with the path to `review.md`. You may add at most two
 sentences after it, under "Reviewer note:", with context the user gave you. Never restate or
 summarise findings in your own words: that is where reviews pick up wrong numbers.
 
@@ -266,11 +350,21 @@ summarise findings in your own words: that is where reviews pick up wrong number
 ### 8. Record what surprised you
 
 If any step did not work as expected (an input in an unforeseen shape, a finding you had to
-correct under Reviewer notes, an error you had to work around), add one entry to
-pitfall-candidates.md next to review.md: the symptom, the cause and what you did. Keep it
-generic: no customer names, table names or values. Maintainers move useful entries into
-`references/pitfalls.md` or fix the engine. Do this after delivering (step 7); do not mention
-it in the chat message.
+correct under Reviewer notes, an error you had to work around), and no entry in
+`yb-model.py pitfall list` covers it, add one to your own list:
+
+```bash
+python3 scripts/yb-model.py pitfall add <bundle> --id <short-id> --title "<what you saw>" \
+    --status "not detected" --body "<why it happens, and what you did>"
+```
+
+Keep it generic. The command refuses an entry that names a table, index, schema or database
+from the bundle (plain or schema-qualified, three characters or more) or a node address; reword
+it rather than work around the check. It cannot recognise values or column names, so leave
+those out yourself. An id the skill already
+has is counted as a hit instead. Your list lives in `~/.yb-model/pitfalls.md`; `pitfall export`
+prints it for a pull request against `references/pitfalls.md`. Do this after delivering (step
+7); do not mention it in the chat message.
 
 ## Other skills
 

@@ -20,7 +20,9 @@ NOT_COLS = {"true", "false", "null", "now", "current_timestamp", "current_date",
 
 
 class Pred:
-    """op: eq | in | range | prefix | isnull | notnull | ne | like | rowcmp | or | other"""
+    """op: eq | in | range | prefix | isnull | notnull | ne | like | rowcmp | or | or_eq |
+    other. or_eq: the column is bound by equality in every arm of an OR (as an IN list would
+    bind it, when the planner turns the arms into a BitmapOr); it is recorded besides "or"."""
 
     def __init__(self, table, col, op, expr=None):
         self.table = table
@@ -157,9 +159,6 @@ def _colrefs_in(toks):
         t = toks[k]
         if t.ident is not None and t.kind in ("word", "qident"):
             if k + 2 < len(toks) and toks[k + 1].kind == "." and toks[k + 2].ident is not None:
-                if toks[k + 2].kind == "op":
-                    k += 2
-                    continue
                 out.append((t.ident, toks[k + 2].ident))
                 k += 3
                 continue
@@ -197,6 +196,35 @@ def _split_and(toks):
     if cur:
         parts.append(cur)
     return parts
+
+
+def _split_or(toks):
+    parts, cur = [], []
+    for t in toks:
+        if t.depth == 0 and is_word(t, "OR"):
+            parts.append(cur)
+            cur = []
+            continue
+        cur.append(t)
+    parts.append(cur)
+    return [p for p in parts if p]
+
+
+def _disjunct(ctx, toks):
+    """A disjunction filters on every column it names ("or"). A column every arm binds with
+    equality is also recorded as "or_eq"."""
+    preds = ctx.shape.preds
+    arms = []
+    for arm in _split_or(toks):
+        n = len(preds)
+        _conjunct(ctx, arm)
+        arms.append({(p.table, p.col) for p in preds[n:]
+                     if p.col and p.op in ("eq", "in", "or_eq")})
+        del preds[n:]
+    for q, c in _colrefs_in(toks):
+        _add_pred(ctx, q, c, "or")
+    for table, col in sorted(set.intersection(*arms) if arms else set()):
+        preds.append(Pred(table, col, "or_eq", None))
 
 
 def _strip_parens(toks):
@@ -237,14 +265,15 @@ def _conjunct(ctx, toks):
     if not toks:
         return
     d = 0
-    if any(t.depth == d and is_word(t, "AND") for t in toks) and \
-            not any(t.depth == d and is_word(t, "BETWEEN") for t in toks):
-        for p in _split_and(toks):
-            _conjunct(ctx, p)
-        return
+    # OR binds looser than AND: "a = 1 AND b = 2 OR a = 3 AND b = 4" is a disjunction of two
+    # conjunctions, so a top-level OR is tested first.
     if any(t.depth == d and is_word(t, "OR") for t in toks):
-        for q, c in _colrefs_in(toks):
-            _add_pred(ctx, q, c, "or")
+        _disjunct(ctx, toks)
+        return
+    parts = _split_and(toks)  # keeps BETWEEN x AND y together
+    if len(parts) > 1:
+        for p in parts:
+            _conjunct(ctx, p)
         return
     if is_word(toks[0], "NOT"):
         for q, c in _colrefs_in(toks):
@@ -277,8 +306,10 @@ def _conjunct(ctx, toks):
             if cr:
                 _add_pred(ctx, cr[0], cr[1], "in")
             elif left and left[0].kind == "(":
+                # (a, b) IN ((1, 2), (3, 4)): each column takes one of the listed values, and
+                # DocDB seeks on the tuples as on an IN list (not a row comparison).
                 for q, c in _colrefs_in(left):
-                    _add_pred(ctx, q, c, "rowcmp")
+                    _add_pred(ctx, q, c, "in")
             return
         if is_word(t, "BETWEEN"):
             cr = _colref(toks[:k])
@@ -439,9 +470,8 @@ def _parse_from(ctx, toks):
             continue
         ctx.alias[alias] = name
         ctx.shape.refs.append((alias, name))
-    for p in on_parts:
-        for c in _split_and(rebase(p)):
-            _conjunct(ctx, c)
+    for p in on_parts:  # _conjunct splits on AND only when no OR sits at the top level
+        _conjunct(ctx, rebase(p))
 
 
 def _subqueries(ctx, toks):
@@ -470,8 +500,7 @@ def _strip_subqueries(toks):
 def _where(ctx, toks):
     _subqueries(ctx, toks)
     toks = _strip_subqueries(toks)
-    for c in _split_and(rebase(toks)):
-        _conjunct(ctx, c)
+    _conjunct(ctx, rebase(toks))
 
 
 def _analyze_tokens(st, schema, ctes=None):

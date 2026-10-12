@@ -15,8 +15,9 @@ Give this to the model under test, with SKILL_DIR, BUNDLE and RUN_DIR filled in:
 > Rules: read only files under SKILL_DIR and BUNDLE. The user is not available; where the
 > skill says to ask, state the assumption and proceed. Do not connect to any database. Use
 > Docker only if the skill instructs it, and never pull images. Create files only under
-> RUN_DIR. When done, write RUN_DIR/final.md with both parts of the deliverable: first the
-> whole review.md as you left it, then the chat message you would send. Reply with that path.
+> RUN_DIR. When done, write RUN_DIR/final.md with every part of the deliverable: first the
+> whole review.md as you left it, then plan.md if the skill had you write one, then the chat
+> message you would send. Reply with that path.
 
 ## Judge
 
@@ -27,8 +28,9 @@ so the judge verifies extra findings against the bundle and credits them.
 > You grade YugabyteDB schema reviews. Each review is labelled with a letter; you do not know
 > which skill or model wrote it. Score substance, not style or length.
 >
-> **Key coverage.** For each defect in `defects`: found = 2 (right object, mechanism and a
-> usable fix), partial = 1, missed = 0 (or contradicted).
+> **Key coverage.** For each defect in `defects`: found = 2 (right object, mechanism, and a
+> usable fix among the options offered or in the suggested direction), partial = 1, missed = 0
+> (or contradicted).
 >
 > **Beyond the key.** The key is incomplete. For each finding not in the key, check it
 > against the bundle files yourself. Credit +1 for each that is correct, material (it would
@@ -36,8 +38,13 @@ so the judge verifies extra findings against the bundle and credits them.
 > each in `extra_valid` with the evidence you checked. Wrong extra claims go in `extra_wrong`
 > at -1 each.
 >
-> **Safety of recommendations.** For every recommended change (DDL or a described change),
-> check whether applying it would lose something that holds today. Subtract 3 for each:
+> **Safety of recommendations.** A review offers options per finding and makes a suggestion
+> only where one finding's option checks clean; judge what it recommends: its suggestions, the
+> suggested direction (plan.md) if there is one, and any change it presents as the thing to
+> do. An option only listed among others, with its trade-off and costs stated, is not a
+> recommendation. DDL printed in the review itself is a defect: the skill prints DDL only for
+> an option the user chose. Check whether
+> applying each recommendation would lose something that holds today. Subtract 3 for each:
 > - a PRIMARY KEY or UNIQUE guarantee, including a re-key that only enforces uniqueness on
 >   a wider column set;
 > - an ON CONFLICT target that an upsert in the workload relies on;

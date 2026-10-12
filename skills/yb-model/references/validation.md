@@ -2,12 +2,16 @@
 
 Contents: A) query pack · B) reading the results · C) config baseline · D) sign-off gate
 
-`scripts/collect.sql` already captures A1, A4, A6, A7 and A8, plus settings and version.
+`scripts/collect.sql` already captures A1, A4, A6 and A8, plus settings and version.
 `yb-model.py review --replay` already runs EXPLAIN on every pattern against injected
-statistics. Use this file for the live-cluster checks that remain: `EXPLAIN (ANALYZE,
-DIST)` on the target, parse-checking recommended DDL, and the sign-off gate.
+statistics. Use this file for the checks that remain: `EXPLAIN (ANALYZE, DIST)` of read
+patterns on the target, parse-checking recommended DDL on a scratch instance, and the
+sign-off gate.
 
-Everything here is read-only on the customer's cluster. **Never run recommended DDL there**
+Every query here only reads, except A14: `EXPLAIN ANALYZE` executes the statement. On the
+customer's cluster, run A14 only for SELECT patterns, and only with the user's permission.
+Plan an INSERT, UPDATE or DELETE pattern there with plain `EXPLAIN` (no ANALYZE), or run it
+with ANALYZE on the replay container. **Never run recommended DDL on the customer's cluster**
 (it includes `DROP INDEX`, primary-key swaps and index rebuilds). Parse-check it on a scratch
 instance of the same release, such as the replay container, or give it to the user to run.
 
@@ -39,11 +43,16 @@ SELECT <col>, count(*) FROM public.<table> GROUP BY 1 ORDER BY 2 DESC LIMIT 20;
 SELECT schemaname, relname, indexrelname, idx_scan, idx_tup_read, idx_tup_fetch
 FROM pg_stat_user_indexes WHERE schemaname='public' ORDER BY idx_scan ASC;
 
--- A5. Unused non-unique, non-primary indexes, with drop statements
+-- A5. Candidates for removal: non-unique, non-primary indexes with no scans through THIS
+-- node. Counters are per node: run it on every node, and an index is a candidate only if it
+-- is listed on all of them. A partition's copy of a partitioned index (copy_of) is never
+-- dropped on its own: judge the parent by all its copies. Do not build DROP statements from
+-- this list: once the user chooses a finding's drop option, `yb-model.py sketch <bundle>
+-- <finding> --option drop` prints it, after the engine's checks.
 SELECT relname AS table_name, indexrelname AS index_name,
        pg_size_pretty(pg_relation_size(i.indexrelid)) AS index_size,
-       'DROP INDEX IF EXISTS ' || quote_ident(schemaname) || '.'
-         || quote_ident(indexrelname) || ';' AS drop_cmd
+       (SELECT h.inhparent::regclass FROM pg_inherits h
+         WHERE h.inhrelid = i.indexrelid) AS copy_of
 FROM pg_stat_user_indexes s JOIN pg_index i ON s.indexrelid = i.indexrelid
 WHERE idx_scan = 0 AND NOT i.indisprimary AND NOT i.indisunique
 ORDER BY pg_relation_size(i.indexrelid) DESC;
@@ -90,7 +99,8 @@ FROM pg_stat_activity
 WHERE xact_start IS NOT NULL AND state LIKE 'idle in transaction%'
 ORDER BY xact_start;
 
--- A14. Plan with distributed metrics
+-- A14. Plan with distributed metrics. ANALYZE executes the statement: on the customer's
+-- cluster, SELECT patterns only; plan writes with plain EXPLAIN, or on the replay container.
 EXPLAIN (ANALYZE, DIST, DEBUG, COSTS, VERBOSE) <query>;
 
 -- A15. Get the full DDL with tablet splits
@@ -157,8 +167,9 @@ without measurements is a structural review and must say so.
 
 - [ ] Preconditions measured: null fractions and cardinalities for every hash-key and
       leading-index column.
-- [ ] `pg_stat_user_indexes` reviewed before any index drop.
-- [ ] `EXPLAIN (ANALYZE, DIST)` run on every access pattern; plans match expectations.
+- [ ] `pg_stat_user_indexes` reviewed on every node before any index drop.
+- [ ] `EXPLAIN (ANALYZE, DIST)` run on every read pattern, and write patterns planned with
+      plain `EXPLAIN` (or with ANALYZE on a scratch instance); plans match expectations.
 - [ ] Tablet counts verified with `yb_table_properties` (A6), not read from the DDL.
 - [ ] Every recommended DDL statement parse-checked on a scratch instance of the customer's
       release (never on the customer's cluster); version recorded.
